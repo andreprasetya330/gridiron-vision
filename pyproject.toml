@@ -29,6 +29,7 @@ dependencies = [
     "tqdm>=4.66",
     "python-dotenv>=1.0",
     "kagglehub>=0.3",
+    "rdata>=0.11",
 ]
 
 [project.optional-dependencies]

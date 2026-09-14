@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from gridiron.taxonomy import COVERAGES
 from gridiron.tracking.bdb import (
@@ -55,6 +56,22 @@ def test_league_rates_are_the_observed_mix(tmp_path):
     assert loaded is not None
     assert loaded["Cover 3 Zone"] == 0.7
     assert loaded["Prevent"] == 0.0
+
+
+def test_normalize_label_frame_accepts_snake_and_camel_case():
+    from gridiron.tracking.bdb import normalize_label_frame
+
+    snake = pd.DataFrame(
+        {"game_id": [2018090600.0], "play_id": [75.0], "coverage": ["Cover 3 Zone"]}
+    )
+    camel = pd.DataFrame(
+        {"gameId": [2018090600.0], "playId": [1101.0], "coverage": ["Cover 1 Man"]}
+    )
+    out = normalize_label_frame(snake)
+    assert list(out.columns) == ["gameId", "playId", "coverage"]
+    assert int(out.loc[0, "gameId"]) == 2018090600
+    assert int(out.loc[0, "playId"]) == 75
+    assert normalize_label_frame(camel).loc[0, "playId"] == 1101
 
 
 def test_copy_csvs_flattens_nested_kagglehub_layout(tmp_path):

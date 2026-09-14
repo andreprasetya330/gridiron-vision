@@ -7,8 +7,8 @@ community has published per-play coverage labels on top of it.
 Expected layout under `data/raw/bdb/`:
 
     games.csv, players.csv, plays.csv, week1.csv ... week17.csv
-    coverages_week1.csv          (Kaggle: tombliss/additional-data-coverage-schemes-for-week-1)
-    coverages_2018.csv           (optional, the fuller label set)
+    coverages_week1.csv          (Telemetry week-1 labels; Kaggle copy is gone)
+    coverages_2018.csv           (optional fuller 2018 set from ngscleanR)
 
 Nothing here fails hard on missing files - it reports what it found and lets the
 caller fall back to synthetic data.
@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Iterator
 
@@ -38,7 +39,19 @@ from gridiron.tracking.schema import (
 )
 
 KAGGLE_COMPETITION = "nfl-big-data-bowl-2021"
+# Tom Bliss unpublished this Kaggle dataset; download() still tries it, then
+# falls back to the public ngscleanR copies of the same labels.
 KAGGLE_COVERAGE_DATASET = "tombliss/additional-data-coverage-schemes-for-week-1"
+GITHUB_COVERAGE_LABELS: dict[str, str] = {
+    "coverages_week1.csv": (
+        "https://raw.githubusercontent.com/guga31bb/ngscleanR/master/"
+        "data-raw/coverages_week1.rds"
+    ),
+    "coverages_2018.csv": (
+        "https://raw.githubusercontent.com/guga31bb/ngscleanR/master/"
+        "data-raw/coverage_labels.rds"
+    ),
+}
 
 # The community label sets use a handful of aliases for the same shells.
 COVERAGE_ALIASES: dict[str, str] = {
@@ -95,6 +108,53 @@ def _extract_zips(directory: Path) -> None:
             zf.extractall(directory)
 
 
+def normalize_label_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Map gameId/playId/coverage columns from either camelCase or snake_case RDS."""
+    cols = {c.lower().replace("_", ""): c for c in df.columns}
+    if "coverage" not in cols or "gameid" not in cols or "playid" not in cols:
+        raise ValueError(f"coverage table needs gameId, playId, coverage; got {list(df.columns)}")
+    out = df[[cols["gameid"], cols["playid"], cols["coverage"]]].copy()
+    out.columns = ["gameId", "playId", "coverage"]
+    out = out.dropna(subset=["gameId", "playId"])
+    out["gameId"] = out["gameId"].astype("int64")
+    out["playId"] = out["playId"].astype("int64")
+    return out
+
+
+def _rds_to_frame(path: Path) -> pd.DataFrame:
+    try:
+        import rdata
+    except ImportError as exc:
+        raise RuntimeError(
+            "Reading ngscleanR coverage labels needs the `rdata` package. "
+            "Run `uv sync` and retry."
+        ) from exc
+    parsed = rdata.parser.parse_file(path)
+    converted = rdata.conversion.convert(parsed)
+    if not isinstance(converted, pd.DataFrame):
+        raise TypeError(f"{path} did not convert to a data frame")
+    return normalize_label_frame(converted)
+
+
+def fetch_github_coverage_labels(directory: Path) -> list[Path]:
+    """Download the public ngscleanR coverage RDS files and write CSVs."""
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for csv_name, url in GITHUB_COVERAGE_LABELS.items():
+        target = directory / csv_name
+        with urllib.request.urlopen(url) as response:
+            rds_bytes = response.read()
+        rds_path = directory / f".{csv_name}.rds"
+        rds_path.write_bytes(rds_bytes)
+        try:
+            frame = _rds_to_frame(rds_path)
+            frame.to_csv(target, index=False)
+            written.append(target)
+        finally:
+            rds_path.unlink(missing_ok=True)
+    return written
+
+
 def download(directory: Path | None = None) -> Path:
     """Fetch BDB 2021 tracking plus week-1 coverage labels.
 
@@ -136,9 +196,10 @@ def download(directory: Path | None = None) -> Path:
             labels_path = Path(kagglehub.dataset_download(KAGGLE_COVERAGE_DATASET))
             _copy_csvs(labels_path, directory)
         except Exception:
-            # Tracking is still usable unlabeled; status() reports the gap.
             pass
         _extract_zips(directory)
+        if not list(directory.glob("coverages*.csv")):
+            fetch_github_coverage_labels(directory)
         return directory
 
     commands = [
@@ -146,8 +207,14 @@ def download(directory: Path | None = None) -> Path:
         ["kaggle", "datasets", "download", "-d", KAGGLE_COVERAGE_DATASET, "-p", str(directory)],
     ]
     for cmd in commands:
-        subprocess.run(cmd, check=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError:
+            if "datasets" not in cmd:
+                raise
     _extract_zips(directory)
+    if not list(directory.glob("coverages*.csv")):
+        fetch_github_coverage_labels(directory)
     return directory
 
 
@@ -222,6 +289,15 @@ def iter_plays(
         )
 
     games = pd.read_csv(directory / "games.csv")
+    if "season" not in games.columns:
+        if "gameDate" in games.columns:
+            games["season"] = (
+                pd.to_datetime(games["gameDate"], format="%m/%d/%Y", errors="coerce")
+                .dt.year.fillna(2018)
+                .astype(int)
+            )
+        else:
+            games["season"] = 2018
     plays = pd.read_csv(directory / "plays.csv")
     labels = _load_coverage_labels(directory)
     if not labels.empty:
@@ -229,9 +305,9 @@ def iter_plays(
     else:
         plays["coverage"] = None
 
-    game_meta = games.set_index("gameId")[
-        ["season", "week", "homeTeamAbbr", "visitorTeamAbbr"]
-    ].to_dict("index")
+    meta_cols = [c for c in ("season", "week", "homeTeamAbbr", "visitorTeamAbbr") if c in games.columns]
+    game_meta = games.set_index("gameId")[meta_cols].to_dict("index")
+    play_lookup = plays.set_index(["gameId", "playId"], drop=False)
 
     week_files = sorted(directory.glob("week*.csv"))
     emitted = 0
@@ -242,15 +318,20 @@ def iter_plays(
             continue
 
         tracking = pd.read_csv(week_file)
+        if labeled_only and not labels.empty:
+            tracking = tracking.merge(labels[["gameId", "playId"]], on=["gameId", "playId"], how="inner")
+            if tracking.empty:
+                continue
         tracking["position"] = tracking["position"].map(
             lambda p: POSITION_GROUPS.get(str(p), None)
         )
 
         for (game_id, play_id), frame in tracking.groupby(["gameId", "playId"], sort=False):
-            play_row = plays[(plays.gameId == game_id) & (plays.playId == play_id)]
-            if play_row.empty:
+            if (game_id, play_id) not in play_lookup.index:
                 continue
-            play_row = play_row.iloc[0]
+            play_row = play_lookup.loc[(game_id, play_id)]
+            if isinstance(play_row, pd.DataFrame):
+                play_row = play_row.iloc[0]
             coverage = normalize_coverage_label(play_row.get("coverage"))
             if labeled_only and coverage is None:
                 continue

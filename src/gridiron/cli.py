@@ -319,7 +319,11 @@ def bdb_download() -> None:
     """Download Big Data Bowl data via the Kaggle CLI."""
     from gridiron.tracking import bdb
 
-    console.print("Uses kagglehub (needs Kaggle credentials and accepted BDB 2021 rules).")
+    console.print(
+        "Uses kagglehub for tracking (accepted BDB 2021 rules). "
+        "Coverage labels fall back to the public ngscleanR copies if the old "
+        "Kaggle extra dataset is gone."
+    )
     path = bdb.download()
     status = bdb.available(path)
     console.print(f"downloaded to {path}")
