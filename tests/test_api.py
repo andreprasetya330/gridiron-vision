@@ -66,13 +66,13 @@ def api_env(tmp_path, monkeypatch):
     )
     (reports / "washington.md").write_text("# Washington\nThey play Cover 3.", encoding="utf-8")
 
-    from gridiron.api.main import create_app, _predictions
+    from gridiron.api.main import _clear_api_caches, create_app
 
-    _predictions.cache_clear()
+    _clear_api_caches()
     from fastapi.testclient import TestClient
 
     yield TestClient(create_app())
-    _predictions.cache_clear()
+    _clear_api_caches()
     cfg.data_dir.cache_clear()
 
 

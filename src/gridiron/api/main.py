@@ -37,9 +37,57 @@ def _predictions() -> dict[str, dict[str, Any]]:
     return {p["play_id"]: p for p in payload}
 
 
-def _play_paths(source: str = "auto") -> dict[str, Path]:
+@lru_cache(maxsize=8)
+def _play_paths(source: str, directory: str, recursive: bool) -> dict[str, Path]:
+    return {p.stem: p for p in iter_play_json(Path(directory), recursive=recursive)}
+
+
+def _paths_for(source: str = "auto") -> dict[str, Path]:
     directory, recursive, _resolved = resolve_play_directory(source)
-    return {p.stem: p for p in iter_play_json(directory, recursive=recursive)}
+    return _play_paths(source, str(directory), recursive)
+
+
+def _summary_row(play_id: str, payload: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
+    quality = payload.get("quality") or {}
+    return {
+        "play_id": play_id,
+        "season": payload.get("season"),
+        "week": payload.get("week"),
+        "defense_team": payload.get("defense_team"),
+        "offense_team": payload.get("offense_team"),
+        "coverage_truth": payload.get("coverage"),
+        "coverage_predicted": prediction.get("coverage"),
+        "confidence": prediction.get("confidence"),
+        "quality_score": quality.get("score"),
+        "usable": quality.get("usable", prediction.get("usable", True)),
+        "source": payload.get("source"),
+        "has_video": bool(payload.get("video_path")),
+        "situation": payload.get("situation", {}),
+    }
+
+
+@lru_cache(maxsize=8)
+def _play_summaries(source: str, directory: str, recursive: bool) -> tuple[dict[str, Any], ...]:
+    predictions = _predictions()
+    rows: list[dict[str, Any]] = []
+    for play_id, path in _play_paths(source, directory, recursive).items():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows.append(_summary_row(play_id, payload, predictions.get(play_id, {})))
+    return tuple(rows)
+
+
+def _summaries_for(source: str = "auto") -> tuple[dict[str, Any], ...]:
+    directory, recursive, _resolved = resolve_play_directory(source)
+    return _play_summaries(source, str(directory), recursive)
+
+
+def _clear_api_caches() -> None:
+    _predictions.cache_clear()
+    _play_paths.cache_clear()
+    _play_summaries.cache_clear()
 
 
 def create_app() -> FastAPI:
@@ -58,7 +106,7 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         _directory, _rec, resolved = resolve_play_directory("auto")
-        paths = _play_paths("auto")
+        paths = _paths_for("auto")
         return {
             "status": "ok",
             "plays": len(paths),
@@ -80,46 +128,23 @@ def create_app() -> FastAPI:
         limit: int = Query(200, le=2000),
         offset: int = 0,
     ) -> dict[str, Any]:
-        predictions = _predictions()
-        rows: list[dict[str, Any]] = []
-
-        for play_id, path in _play_paths(source).items():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-
-            prediction = predictions.get(play_id, {})
-            row = {
-                "play_id": play_id,
-                "season": payload.get("season"),
-                "week": payload.get("week"),
-                "defense_team": payload.get("defense_team"),
-                "offense_team": payload.get("offense_team"),
-                "coverage_truth": payload.get("coverage"),
-                "coverage_predicted": prediction.get("coverage"),
-                "confidence": prediction.get("confidence"),
-                "quality_score": payload.get("quality", {}).get("score"),
-                "usable": payload.get("quality", {}).get("usable", prediction.get("usable", True)),
-                "source": payload.get("source"),
-                "has_video": bool(payload.get("video_path")),
-                "situation": payload.get("situation", {}),
-            }
-            if team and row["defense_team"] != team:
-                continue
-            if coverage and row["coverage_predicted"] != coverage and row["coverage_truth"] != coverage:
-                continue
-            if week is not None and row["week"] != week:
-                continue
-            if usable_only and not row["usable"]:
-                continue
-            rows.append(row)
-
+        rows = [
+            row
+            for row in _summaries_for(source)
+            if (not team or row["defense_team"] == team)
+            and (
+                not coverage
+                or row["coverage_predicted"] == coverage
+                or row["coverage_truth"] == coverage
+            )
+            and (week is None or row["week"] == week)
+            and (not usable_only or row["usable"])
+        ]
         return {"total": len(rows), "plays": rows[offset : offset + limit], "corpus": source}
 
     @app.get("/api/plays/{play_id}")
     def get_play(play_id: str) -> dict[str, Any]:
-        path = _play_paths("all").get(play_id) or _play_paths("auto").get(play_id)
+        path = _paths_for("auto").get(play_id) or _paths_for("all").get(play_id)
         if path is None:
             raise HTTPException(status_code=404, detail=f"unknown play {play_id}")
         play = load_play(path)
@@ -129,7 +154,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/plays/{play_id}/video")
     def get_video(play_id: str) -> FileResponse:
-        path = _play_paths("all").get(play_id) or _play_paths("auto").get(play_id)
+        path = _paths_for("auto").get(play_id) or _paths_for("all").get(play_id)
         if path is None:
             raise HTTPException(status_code=404, detail=f"unknown play {play_id}")
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -141,14 +166,10 @@ def create_app() -> FastAPI:
     @app.get("/api/teams")
     def list_teams() -> dict[str, Any]:
         teams: dict[str, int] = {}
-        for path in _play_paths("auto").values():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            team = payload.get("defense_team")
+        for row in _summaries_for("auto"):
+            team = row.get("defense_team")
             if team:
-                teams[team] = teams.get(team, 0) + 1
+                teams[str(team)] = teams.get(str(team), 0) + 1
         return {"teams": [{"team": t, "plays": n} for t, n in sorted(teams.items())]}
 
     @app.get("/api/reports")

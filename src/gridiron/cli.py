@@ -418,7 +418,30 @@ def train_baseline(
 
     path = cfg.models_dir() / f"baseline_{mode}.joblib"
     model.save(path)
+    predicted = model.predict(test_df)
+    from collections import Counter
+
+    from gridiron.coverage.train import save_metrics
+
+    report = {
+        "mode": mode,
+        "source": resolved,
+        "split": describe_split(train_df, test_df),
+        "train_n": int(len(train_df)),
+        "test_n": int(len(test_df)),
+        "train_weeks": sorted(int(w) for w in train_df["week"].dropna().unique()),
+        "test_weeks": sorted(int(w) for w in test_df["week"].dropna().unique()),
+        "metrics": metrics.to_dict(),
+        "true_class_counts": dict(Counter(test_df["coverage"].dropna().astype(str))),
+        "predicted_class_counts": dict(Counter(str(x) for x in predicted)),
+        "dropped_columns": model.dropped_columns,
+        "model_path": str(path),
+    }
+    metrics_file = cfg.models_dir() / f"baseline_{mode}_metrics.json"
+    report["metrics_path"] = str(metrics_file)
+    save_metrics(report, metrics_file)
     console.print(f"saved to {path}")
+    console.print(f"metrics -> {metrics_file}")
 
 
 @train_app.command("net")
