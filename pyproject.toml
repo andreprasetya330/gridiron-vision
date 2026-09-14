@@ -1,0 +1,84 @@
+[project]
+name = "gridiron-vision"
+version = "0.1.0"
+description = "AI coverage detection for American football film: video -> field coordinates -> coverage -> validated tells -> scouting reports"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=16.0",
+    "duckdb>=1.1",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "statsmodels>=0.14",
+    "shap>=0.46",
+    # shap pulls llvmlite transitively and the resolver will happily pick an
+    # ancient build that refuses to compile on 3.12. Pin the modern line.
+    "llvmlite>=0.44",
+    "numba>=0.61",
+    "joblib>=1.4",
+    "torch>=2.9",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "tqdm>=4.66",
+    "python-dotenv>=1.0",
+    "kagglehub>=0.3",
+]
+
+[project.optional-dependencies]
+# Vision extras are separated because ultralytics/opencv pull a large tree and are
+# only needed once you are actually processing film.
+vision = [
+    "opencv-python>=4.10",
+    "ultralytics>=8.3",
+    # ByteTrack is deprecated in supervision 0.28 and removed in 0.31, and it is
+    # the only tracker here that handles crossing players well. build_tracker
+    # falls back to the built-in IoU tracker if it vanishes, so an upgrade
+    # degrades quality silently rather than failing - hence the ceiling.
+    "supervision>=0.23,<0.31",
+    "torchvision>=0.24",
+]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+gridiron = "gridiron.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gridiron"]
+
+# RTX 5060 is Blackwell (sm_120). Only cu128+ wheels contain kernels for it;
+# a default CPU/cu126 wheel fails at runtime with "no kernel image is available".
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["slow: trains a model; excluded with -m 'not slow'"]

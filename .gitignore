@@ -1,0 +1,38 @@
+# Data and models are never committed
+data/
+models/
+artifacts/
+*.mp4
+*.mov
+*.avi
+*.pt
+*.onnx
+*.parquet
+*.duckdb
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+uv.lock
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+web/dist/
+web/.vite/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,135 @@
+"""Project paths and runtime configuration."""
+
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+def _env_path(var: str, default: Path) -> Path:
+    raw = os.environ.get(var, "").strip()
+    return Path(raw).expanduser().resolve() if raw else default
+
+
+@lru_cache(maxsize=1)
+def data_dir() -> Path:
+    return _env_path("GRIDIRON_DATA_DIR", PROJECT_ROOT / "data")
+
+
+def subdir(*parts: str) -> Path:
+    """Return a data subdirectory, creating it on demand."""
+    path = data_dir().joinpath(*parts)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def raw_dir() -> Path:
+    return subdir("raw")
+
+
+def bdb_dir() -> Path:
+    return subdir("raw", "bdb")
+
+
+def pff_dir() -> Path:
+    return subdir("pff")
+
+
+PREDICTIONS_FILENAME = "predictions.json"
+
+# Real data first. `auto` picks the first of these that actually has plays, so a
+# leftover synthetic season cannot silently contaminate a Big Data Bowl training
+# run (or the other way around).
+PLAY_SOURCE_PRIORITY: tuple[str, ...] = ("bdb", "film", "pff", "hudl", "synthetic")
+
+
+def plays_dir(source: str | None = None) -> Path:
+    """Play JSON lives under `data/plays/<source>/` so corpora cannot mix.
+
+    Passing no source returns the parent directory, which is also where
+    `predictions.json` lives - one overlay file, keyed by play id.
+    """
+    if source:
+        return subdir("plays", source)
+    return subdir("plays")
+
+
+def predictions_path() -> Path:
+    return plays_dir() / PREDICTIONS_FILENAME
+
+
+def iter_play_json(directory: Path, recursive: bool = False) -> list[Path]:
+    directory = Path(directory)
+    if not directory.exists():
+        return []
+    pattern = "**/*.json" if recursive else "*.json"
+    return sorted(
+        p for p in directory.glob(pattern) if p.is_file() and p.name != PREDICTIONS_FILENAME
+    )
+
+
+def play_source_counts() -> dict[str, int]:
+    root = plays_dir()
+    counts = {name: len(iter_play_json(root / name)) for name in PLAY_SOURCE_PRIORITY}
+    counts["_root"] = len(iter_play_json(root))
+    return counts
+
+
+def resolve_play_directory(source: str = "auto") -> tuple[Path, bool, str]:
+    """Pick which play files to load.
+
+    Returns `(directory, recursive, resolved_source)`. `auto` prefers real data
+    over the synthetic season. `all` walks every source together - only for
+    explicit mixes, never the default.
+    """
+    requested = (source or "auto").strip().lower()
+    if requested in {"all", "mix"}:
+        return plays_dir(), True, "all"
+    if requested != "auto":
+        return plays_dir(requested), False, requested
+
+    counts = play_source_counts()
+    for name in PLAY_SOURCE_PRIORITY:
+        if counts.get(name, 0):
+            return plays_dir(name), False, name
+    return plays_dir(), False, "legacy"
+
+
+def film_dir() -> Path:
+    return subdir("film")
+
+
+def models_dir() -> Path:
+    return subdir("models")
+
+
+def reports_dir() -> Path:
+    return subdir("reports")
+
+
+def db_path() -> Path:
+    return data_dir() / "gridiron.duckdb"
+
+
+class LLMSettings:
+    """Optional LLM used only for narrative prose in scouting reports.
+
+    The evidence bundle is always computed deterministically. If no endpoint is
+    configured the report renderer falls back to templated prose, which is
+    verbose but never wrong.
+    """
+
+    def __init__(self) -> None:
+        self.base_url = os.environ.get("GRIDIRON_LLM_BASE_URL", "").strip()
+        self.api_key = os.environ.get("GRIDIRON_LLM_API_KEY", "").strip()
+        self.model = os.environ.get("GRIDIRON_LLM_MODEL", "gpt-4o-mini").strip()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.api_key)
