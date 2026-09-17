@@ -15,7 +15,7 @@ quality.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -39,11 +39,12 @@ class TrackerConfig:
 
 
 class SimpleTracker:
-    """IoU plus centroid-distance tracker.
+    """IoU plus predicted-centroid tracker.
 
-    Deliberately simple. On stable wide-angle film with 30 fps and players moving
-    under 10 yards/second, greedy IoU matching with a distance gate holds identity
-    about as well as a Kalman filter, and it has no dependencies and no tuning.
+    Players on All-22 move a few dozen pixels per frame. Matching the last box
+    alone swaps identities every time two similar jerseys cross. Predicting the
+    next center from recent velocity, then smoothing the accepted box, is the
+    cheapest Kalman that still holds a rusher through the pile.
     """
 
     def __init__(self, config: TrackerConfig | None = None) -> None:
@@ -51,7 +52,12 @@ class SimpleTracker:
         self._next_id = 0
         self._tracks: dict[int, dict[str, Any]] = {}
 
-    def update(self, detections: list[Detection], frame_index: int) -> list[TrackedDetection]:
+    def update(
+        self,
+        detections: list[Detection],
+        frame_index: int,
+        frame: np.ndarray | None = None,
+    ) -> list[TrackedDetection]:
         cfg = self.config
         active = {
             tid: t for tid, t in self._tracks.items() if frame_index - t["last_frame"] <= cfg.max_age
@@ -64,11 +70,18 @@ class SimpleTracker:
         pairs: list[tuple[float, int, int]] = []
         for di, det in enumerate(detections):
             for tid, track in active.items():
+                dt = max(1, frame_index - int(track["last_frame"]))
+                vx, vy = track.get("velocity", (0.0, 0.0))
+                predicted = (
+                    track["center"][0] + vx * dt,
+                    track["center"][1] + vy * dt,
+                )
                 iou = _iou(det, track["box"])
-                distance = float(np.linalg.norm(np.array(det.center) - np.array(track["center"])))
-                if iou < cfg.iou_threshold and distance > cfg.max_distance_px:
+                distance = float(np.linalg.norm(np.array(det.center) - np.array(predicted)))
+                gate = cfg.max_distance_px * (1.0 + 0.12 * (dt - 1))
+                if iou < cfg.iou_threshold and distance > gate:
                     continue
-                cost = (1.0 - iou) + distance / max(cfg.max_distance_px, 1.0)
+                cost = (1.0 - iou) + distance / max(gate, 1.0)
                 pairs.append((cost, di, tid))
 
         for _, di, tid in sorted(pairs):
@@ -83,21 +96,175 @@ class SimpleTracker:
             if tid is None:
                 tid = self._next_id
                 self._next_id += 1
-                self._tracks[tid] = {"hits": 0, "created": frame_index}
-            track = self._tracks.setdefault(tid, {"hits": 0, "created": frame_index})
+                self._tracks[tid] = {
+                    "hits": 0,
+                    "created": frame_index,
+                    "velocity": (0.0, 0.0),
+                }
+            track = self._tracks.setdefault(
+                tid, {"hits": 0, "created": frame_index, "velocity": (0.0, 0.0)}
+            )
+            prev_center = track.get("center")
+            prev_frame = track.get("last_frame", frame_index)
+            prev_box = track.get("box")
+            alpha = 0.55 if prev_box is not None else 1.0
+            box = (
+                alpha * det.x1 + (1.0 - alpha) * prev_box[0],
+                alpha * det.y1 + (1.0 - alpha) * prev_box[1],
+                alpha * det.x2 + (1.0 - alpha) * prev_box[2],
+                alpha * det.y2 + (1.0 - alpha) * prev_box[3],
+            ) if prev_box is not None else (det.x1, det.y1, det.x2, det.y2)
+            center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+            dt = max(1, frame_index - int(prev_frame)) if prev_center is not None else 1
+            if prev_center is not None:
+                inst = (
+                    (center[0] - prev_center[0]) / dt,
+                    (center[1] - prev_center[1]) / dt,
+                )
+                old_v = track.get("velocity", (0.0, 0.0))
+                velocity = (0.65 * old_v[0] + 0.35 * inst[0], 0.65 * old_v[1] + 0.35 * inst[1])
+            else:
+                velocity = (0.0, 0.0)
             track.update(
                 {
-                    "box": (det.x1, det.y1, det.x2, det.y2),
-                    "center": det.center,
+                    "box": box,
+                    "center": center,
                     "last_frame": frame_index,
                     "hits": track.get("hits", 0) + 1,
+                    "velocity": velocity,
                 }
             )
-            output.append(TrackedDetection(det, tid, frame_index))
+            smoothed = Detection(
+                box[0], box[1], box[2], box[3], det.confidence, det.class_id, det.class_name
+            )
+            output.append(TrackedDetection(smoothed, tid, frame_index))
         return output
 
     def track_stats(self) -> dict[int, dict[str, Any]]:
         return self._tracks
+
+
+class _ResultsView:
+    """The minimal `Results`-like object ultralytics' trackers consume.
+
+    They touch `xywh`, `xyxy`, `conf`, `cls`, `len()`, and boolean indexing, so
+    a view over our own detections is enough. Going through this shim rather
+    than `model.track()` keeps the detector injectable, which is what lets the
+    pipeline be tested against known-truth boxes.
+
+    `xyxy` is not optional: camera-motion compensation uses it to mask players
+    out before estimating the camera transform, and without it GMC silently
+    falls back to an identity transform - the tracker still runs, it just stops
+    compensating for the pan, which is the whole reason it is here.
+    """
+
+    def __init__(self, xywh: np.ndarray, conf: np.ndarray, cls: np.ndarray) -> None:
+        self.xywh = xywh
+        self.conf = conf
+        self.cls = cls
+
+    @property
+    def xyxy(self) -> np.ndarray:
+        if self.xywh.size == 0:
+            return self.xywh.reshape(0, 4)
+        cx, cy, w, h = (self.xywh[:, i] for i in range(4))
+        return np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1)
+
+    def __len__(self) -> int:
+        return int(self.conf.shape[0])
+
+    def __getitem__(self, mask) -> _ResultsView:
+        return _ResultsView(self.xywh[mask], self.conf[mask], self.cls[mask])
+
+
+class BotSortTracker:
+    """BoT-SORT: Kalman motion model plus global camera-motion compensation.
+
+    All-22 pans and zooms on almost every snap. A tracker that assumes a fixed
+    camera spends its whole distance budget explaining the pan, and then has
+    nothing left to tell two crossing defenders apart - which is the identity
+    churn that makes an overlay look like it is guessing. GMC estimates the
+    frame-to-frame camera transform with sparse optical flow and subtracts it,
+    so the motion the tracker sees is the motion of the players.
+    """
+
+    def __init__(self, frame_rate: int = 30, track_buffer: int = 60) -> None:
+        from types import SimpleNamespace
+
+        from ultralytics.trackers import BOTSORT
+
+        self.args = SimpleNamespace(
+            tracker_type="botsort",
+            track_high_thresh=0.25,
+            track_low_thresh=0.08,
+            # Only a confident box may *start* an identity, while weak boxes are
+            # still used to extend one. That asymmetry is what stops a flickering
+            # low-score detection from spawning a fresh track every few frames.
+            new_track_thresh=0.55,
+            # Players disappear behind the pile for most of a second. Holding a
+            # lost track that long is what lets it be re-found as itself.
+            track_buffer=track_buffer,
+            match_thresh=0.85,
+            fuse_score=True,
+            gmc_method="sparseOptFlow",
+            proximity_thresh=0.5,
+            appearance_thresh=0.8,
+            with_reid=False,
+            model="auto",
+        )
+        self.tracker = BOTSORT(self.args)
+        self.frame_rate = frame_rate
+
+    def update(
+        self,
+        detections: list[Detection],
+        frame_index: int,
+        frame: np.ndarray | None = None,
+    ) -> list[TrackedDetection]:
+        if not detections:
+            return []
+        xywh = np.array(
+            [
+                [
+                    (d.x1 + d.x2) / 2.0,
+                    (d.y1 + d.y2) / 2.0,
+                    d.x2 - d.x1,
+                    d.y2 - d.y1,
+                ]
+                for d in detections
+            ],
+            dtype=np.float32,
+        )
+        conf = np.array([d.confidence for d in detections], dtype=np.float32)
+        cls = np.array([d.class_id for d in detections], dtype=np.float32)
+
+        tracks = self.tracker.update(_ResultsView(xywh, conf, cls), frame)
+
+        output: list[TrackedDetection] = []
+        for row in np.asarray(tracks):
+            if row.size < 7:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in row[:4])
+            track_id = int(row[4])
+            score = float(row[5])
+            class_id = int(row[6])
+            source = detections[int(row[7])] if row.size > 7 else None
+            output.append(
+                TrackedDetection(
+                    Detection(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        score,
+                        class_id,
+                        source.class_name if source else "player",
+                    ),
+                    track_id,
+                    frame_index,
+                )
+            )
+        return output
 
 
 class ByteTrackAdapter:
@@ -151,6 +318,16 @@ class ByteTrackAdapter:
 
 
 def build_tracker(frame_rate: int = 30, prefer_bytetrack: bool = True):
+    """Best available tracker, degrading rather than failing.
+
+    BoT-SORT first because camera-motion compensation is the single biggest win
+    on panning film; the hand-rolled tracker last so the pipeline still runs
+    with only numpy installed.
+    """
+    try:
+        return BotSortTracker(frame_rate=frame_rate)
+    except Exception:
+        pass
     if prefer_bytetrack:
         try:
             return ByteTrackAdapter(frame_rate=frame_rate)

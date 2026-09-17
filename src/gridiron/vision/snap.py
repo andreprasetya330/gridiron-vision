@@ -74,7 +74,7 @@ def find_snap(
     smoothed = _smooth(energy, max(3, int(fps * 0.1)))
     window = max(2, int(stillness_window * fps))
 
-    best: SnapCandidate | None = None
+    candidates: list[SnapCandidate] = []
     for i in range(window, len(smoothed) - 2):
         before = smoothed[i - window : i]
         after = smoothed[i : i + max(2, int(fps * 0.3))]
@@ -89,13 +89,18 @@ def find_snap(
         if ratio < min_ratio:
             continue
         score = ratio * burst
-        if best is None or score > best.score:
-            best = SnapCandidate(frame_index=i, score=score, stillness_before=stillness)
+        candidates.append(
+            SnapCandidate(frame_index=i, score=score, stillness_before=stillness)
+        )
 
-    if best is None:
+    if not candidates:
         return None
-    best.confidence = float(np.clip(np.log1p(best.score) / 4.0, 0.0, 1.0))
-    return best
+    # The snap is the first explosion after stillness. A later pile-up is
+    # louder, and using it as the snap puts the coverage window on the tackle.
+    peak = max(c.score for c in candidates)
+    chosen = next(c for c in candidates if c.score >= 0.4 * peak)
+    chosen.confidence = float(np.clip(np.log1p(chosen.score) / 4.0, 0.0, 1.0))
+    return chosen
 
 
 def segment_plays(

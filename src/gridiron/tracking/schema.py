@@ -33,9 +33,12 @@ FPS = 10.0
 PRE_SNAP_SECONDS = 2.0
 POST_SNAP_SECONDS = 3.0
 
-TIME_GRID: np.ndarray = np.round(
-    np.arange(-PRE_SNAP_SECONDS, POST_SNAP_SECONDS + 1e-9, 1.0 / FPS), 2
-)
+def make_time_grid(pre: float = PRE_SNAP_SECONDS, post: float = POST_SNAP_SECONDS) -> np.ndarray:
+    """10 Hz grid from `-pre` to `+post`, always including the snap at 0.0."""
+    return np.round(np.arange(-pre, post + 1e-9, 1.0 / FPS), 2)
+
+
+TIME_GRID: np.ndarray = make_time_grid()
 N_FRAMES = len(TIME_GRID)
 SNAP_INDEX = int(np.argmin(np.abs(TIME_GRID)))
 
@@ -61,6 +64,12 @@ class Situation:
     ball_y_from_center: float = 0.0  # + toward the offense's right
     hash_side: Literal["left", "right", "middle"] | None = None
     league: str = "nfl"
+    # BDB 2025 (and any later corpus with a long pre-snap window) can fill these.
+    # 2021 plays leave them None; cues treat that as "unknown", not "no motion".
+    pre_snap_motion_yards: float | None = None
+    motion_at_snap: bool | None = None
+    shift_since_lineset: bool | None = None
+    motion_since_lineset: bool | None = None
 
     @property
     def field_side(self) -> Literal["left", "right", "none"]:
@@ -125,9 +134,14 @@ class PlayerTrack:
     def __post_init__(self) -> None:
         self.x = np.asarray(self.x, dtype=np.float32)
         self.y = np.asarray(self.y, dtype=np.float32)
-        if self.x.shape != (N_FRAMES,) or self.y.shape != (N_FRAMES,):
+        if self.x.ndim != 1 or self.x.shape != self.y.shape:
             raise ValueError(
-                f"track {self.track_id}: expected {N_FRAMES} frames, "
+                f"track {self.track_id}: x/y must be 1-D and the same length, "
+                f"got x={self.x.shape} y={self.y.shape}"
+            )
+        if self.x.shape[0] < N_FRAMES:
+            raise ValueError(
+                f"track {self.track_id}: expected at least {N_FRAMES} frames, "
                 f"got x={self.x.shape} y={self.y.shape}"
             )
 
@@ -174,9 +188,9 @@ def infer_game_id(
     season-week-matchup, which is the grain a held-out split has to respect:
     two plays from the same game share personnel and game plan.
     """
-    if play_id.startswith("bdb-"):
+    if play_id.startswith("bdb"):
         parts = play_id.split("-")
-        if len(parts) >= 3:
+        if len(parts) >= 3 and parts[1].isdigit():
             return parts[1]
     if week is not None and defense_team and offense_team:
         return f"{season or 0}-W{int(week):02d}-{defense_team}-{offense_team}"
@@ -210,8 +224,20 @@ class PlayTracks:
     play_direction: str = "right"
     video_width: int | None = None
     video_height: int | None = None
+    # Coverage scoring always reads the first N_FRAMES (the locked ± window).
+    # Film plays may extend `time_grid` past +3s so the overlay can follow the
+    # rest of the clip instead of cutting it off.
+    time_grid: np.ndarray = field(default_factory=lambda: TIME_GRID.copy())
 
     def __post_init__(self) -> None:
+        self.time_grid = np.asarray(self.time_grid, dtype=np.float64)
+        n = int(self.time_grid.shape[0])
+        for player in self.players:
+            if player.x.shape[0] != n:
+                raise ValueError(
+                    f"track {player.track_id}: {player.x.shape[0]} samples, "
+                    f"time_grid has {n}"
+                )
         if not self.game_id:
             self.game_id = infer_game_id(
                 self.play_id,
@@ -247,7 +273,10 @@ class PlayTracks:
         players = sorted(players, key=lambda p: p.track_id)
         if not players:
             return np.zeros((0, N_FRAMES, 2), dtype=np.float32)
-        return np.stack([np.stack([p.x, p.y], axis=-1) for p in players], axis=0)
+        return np.stack(
+            [np.stack([p.x[:N_FRAMES], p.y[:N_FRAMES]], axis=-1) for p in players],
+            axis=0,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -275,7 +304,7 @@ class PlayTracks:
                 "score": round(self.quality.score, 3),
                 "usable": self.quality.usable,
             },
-            "time_grid": TIME_GRID.tolist(),
+            "time_grid": [round(float(t), 2) for t in self.time_grid],
             "players": [
                 {
                     "track_id": p.track_id,
@@ -339,6 +368,7 @@ class PlayTracks:
             play_direction=payload.get("play_direction", "right"),
             video_width=payload.get("video_width"),
             video_height=payload.get("video_height"),
+            time_grid=np.array(payload.get("time_grid", TIME_GRID.tolist()), dtype=np.float64),
         )
 
 
@@ -395,9 +425,13 @@ def load_corpus(source: str = "auto", limit: int | None = None) -> list[PlayTrac
 
 
 def resample_to_grid(
-    times: np.ndarray, values: np.ndarray, max_gap: float = 0.4, edge_tolerance: float = 0.06
+    times: np.ndarray,
+    values: np.ndarray,
+    max_gap: float = 0.4,
+    edge_tolerance: float = 0.06,
+    grid: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Put an irregular observation series onto TIME_GRID.
+    """Put an irregular observation series onto a 10 Hz grid.
 
     Interpolates across short gaps but refuses to bridge long ones - a defender
     missing for a second should stay missing rather than become a straight line
@@ -405,28 +439,29 @@ def resample_to_grid(
 
     `edge_tolerance` covers the boundary case where a series nominally spans the
     whole grid but floating-point drift leaves its last sample a hair short of
-    3.0 seconds. Dropping the final frame over 1e-15 of rounding would be a
+    the last tick. Dropping the final frame over 1e-15 of rounding would be a
     silent, recurring data loss, so the nearest observation is used instead.
     """
+    grid = TIME_GRID if grid is None else np.asarray(grid, dtype=np.float64)
     times = np.asarray(times, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
     ok = np.isfinite(times) & np.isfinite(values)
     times, values = times[ok], values[ok]
     if times.size == 0:
-        return np.full(N_FRAMES, np.nan, dtype=np.float32)
+        return np.full(grid.shape[0], np.nan, dtype=np.float32)
     order = np.argsort(times)
     times, values = times[order], values[order]
 
-    out = np.interp(TIME_GRID, times, values, left=np.nan, right=np.nan)
+    out = np.interp(grid, times, values, left=np.nan, right=np.nan)
 
-    just_before = (TIME_GRID < times[0]) & (TIME_GRID >= times[0] - edge_tolerance)
-    just_after = (TIME_GRID > times[-1]) & (TIME_GRID <= times[-1] + edge_tolerance)
+    just_before = (grid < times[0]) & (grid >= times[0] - edge_tolerance)
+    just_after = (grid > times[-1]) & (grid <= times[-1] + edge_tolerance)
     out[just_before] = values[0]
     out[just_after] = values[-1]
 
     # Blank out grid points that sit inside a gap wider than max_gap.
-    idx = np.searchsorted(times, TIME_GRID)
-    for i, t in enumerate(TIME_GRID):
+    idx = np.searchsorted(times, grid)
+    for i in range(grid.shape[0]):
         lo = idx[i] - 1
         hi = idx[i]
         if lo < 0 or hi >= times.size:
@@ -434,3 +469,20 @@ def resample_to_grid(
         if times[hi] - times[lo] > max_gap:
             out[i] = np.nan
     return out.astype(np.float32)
+
+
+def smooth_track(values: np.ndarray, window: int = 3) -> np.ndarray:
+    """Median-filter observed samples. Does not invent positions across NaNs."""
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0 or window < 3:
+        return values
+    out = values.copy()
+    half = window // 2
+    for i in range(values.size):
+        if not np.isfinite(values[i]):
+            continue
+        sl = values[max(0, i - half) : min(values.size, i + half + 1)]
+        finite = sl[np.isfinite(sl)]
+        if finite.size >= 2:
+            out[i] = float(np.median(finite))
+    return out

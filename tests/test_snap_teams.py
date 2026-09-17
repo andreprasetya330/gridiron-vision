@@ -18,14 +18,14 @@ def test_motion_energy_ignores_a_camera_pan():
     assert energy.max() < 0.01
 
 
-def test_find_snap_on_a_stillness_then_burst():
+def test_find_snap_ignores_a_later_pileup():
+    """A tackle is louder than the snap; the snap is still the first burst."""
     energy = np.concatenate(
-        [np.full(30, 0.2), np.full(40, 4.0), np.full(20, 1.0)]
+        [np.full(30, 0.2), np.full(20, 3.0), np.full(50, 0.8), np.full(20, 8.0)]
     )
     snap = find_snap(energy, fps=30.0)
     assert snap is not None
-    # The burst starts at frame 30; smoothing may shift it by a few frames.
-    assert 25 <= snap.frame_index <= 35
+    assert 25 <= snap.frame_index <= 40
 
 
 def test_segment_plays_respects_minimum_gap():

@@ -17,6 +17,7 @@ from gridiron.tracking.schema import (
     frame_at,
     infer_game_id,
     load_plays,
+    make_time_grid,
     resample_to_grid,
     save_play,
 )
@@ -45,6 +46,21 @@ def test_frame_at_rounds_to_nearest():
 def test_track_rejects_wrong_length():
     with pytest.raises(ValueError):
         PlayerTrack(track_id="x", side="defense", x=np.zeros(5), y=np.zeros(5))
+
+
+def test_film_grid_roundtrip_is_longer_than_coverage_window():
+    grid = make_time_grid(2.0, 6.0)
+    track = PlayerTrack(
+        track_id="D_1",
+        side="defense",
+        x=np.zeros(len(grid), dtype=np.float32),
+        y=np.zeros(len(grid), dtype=np.float32),
+    )
+    play = PlayTracks(play_id="film-1", source="film", players=[track], time_grid=grid)
+    restored = PlayTracks.from_dict(play.to_dict())
+    assert len(restored.time_grid) == len(grid)
+    assert restored.time_grid[-1] == pytest.approx(6.0)
+    assert restored.array("defense").shape == (1, N_FRAMES, 2)
 
 
 def test_json_roundtrip_preserves_gaps_as_nan():
@@ -132,6 +148,7 @@ def test_array_is_deterministic_regardless_of_player_order():
 
 def test_game_id_is_inferred_from_bdb_play_id():
     assert infer_game_id("bdb-2018090600-75") == "2018090600"
+    assert infer_game_id("bdb2025-2022090800-75") == "2022090800"
     play = PlayTracks(play_id="bdb-2018090600-75", source="bdb", players=[_track()])
     assert play.game_id == "2018090600"
     assert play.game_key == "2018090600"

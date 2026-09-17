@@ -13,13 +13,14 @@ into the review queue in the UI, and excluded from tell mining.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 
-from gridiron.fields import FIELD_CENTER_Y, get_field
+from gridiron.fields import FIELD_CENTER_Y, FIELD_LENGTH_YD, FIELD_WIDTH_YD, get_field
 from gridiron.tracking.schema import (
     N_FRAMES,
     POST_SNAP_SECONDS,
@@ -28,18 +29,28 @@ from gridiron.tracking.schema import (
     PlayTracks,
     Situation,
     TrackQuality,
+    make_time_grid,
     resample_to_grid,
+    smooth_track,
 )
 from gridiron.vision import require
-from gridiron.vision.detect import Detection, DetectorConfig, PlayerDetector, filter_sideline_detections
+from gridiron.vision.detect import DetectorConfig, PlayerDetector, filter_sideline_detections
+from gridiron.vision.identity import (
+    TrackRoster,
+    build_track_profiles,
+    classify_tracks,
+    finalize_film_players,
+)
 from gridiron.vision.registration import (
     LineRegistrar,
-    Registration,
     SmoothedRegistration,
 )
 from gridiron.vision.snap import find_snap, motion_energy, refine_with_ball, segment_plays
-from gridiron.vision.teams import assign_teams, estimate_line_of_scrimmage
+from gridiron.vision.teams import assign_teams_from_roster, estimate_line_of_scrimmage
 from gridiron.vision.track import build_tracker
+
+# Overlay follows the rest of a Hudl cutup; coverage scoring still uses ±3s.
+FILM_POST_SNAP_SECONDS = 8.0
 
 
 @dataclass
@@ -125,10 +136,14 @@ class FilmPipeline:
             video_path, self.config.stride, self.config.max_frames
         ):
             detections = filter_sideline_detections(self.detector.detect(frame), frame.shape[0])
+            # Officials are not rejected here. At All-22 scale a per-frame
+            # appearance test is a coin flip, and rejecting a real player on
+            # even a few frames breaks his track in half. They are removed
+            # after tracking, once a whole track's appearance can be read.
             players = [d for d in detections if d.class_name == "player"]
             balls = [d for d in detections if d.class_name == "ball"]
 
-            tracked = tracker.update(players, frame_index)
+            tracked = tracker.update(players, frame_index, frame)
 
             if self.config.manual_correspondences is not None:
                 from gridiron.vision.registration import manual_homography
@@ -145,13 +160,18 @@ class FilmPipeline:
                 foot_points = np.array([t.detection.foot_point for t in tracked])
                 mapped = registration.to_field(foot_points)
                 for t, point in zip(tracked, mapped):
-                    if np.all(np.isfinite(point)):
-                        field_positions[t.track_id] = (float(point[0]), float(point[1]))
+                    if not np.all(np.isfinite(point)):
+                        continue
+                    fx, fy = float(point[0]), float(point[1])
+                    if not _on_field(fx, fy):
+                        continue
+                    field_positions[t.track_id] = (fx, fy)
+                field_positions = _drop_sideline_isolates(field_positions)
 
             ball_point = None
             if balls and registration.homography is not None:
                 mapped = registration.to_field(np.array([balls[0].foot_point]))
-                if np.all(np.isfinite(mapped[0])):
+                if np.all(np.isfinite(mapped[0])) and _on_field(float(mapped[0][0]), float(mapped[0][1])):
                     ball_point = (float(mapped[0][0]), float(mapped[0][1]))
 
             frames_meta.append(
@@ -180,12 +200,44 @@ class FilmPipeline:
             else:
                 snap_indices = [snap.frame_index]
                 snap_confidence = snap.confidence
-            segments = [(max(0, i - int(fps * 3)), i, min(len(frames_meta) - 1, i + int(fps * 5))) for i in snap_indices]
+            segments = [(0, i, len(frames_meta) - 1) for i in snap_indices]
             confidences = [snap_confidence]
         else:
             found = segment_plays(energy, fps=fps / max(self.config.stride, 1))
             segments = [(s.start_frame, s.snap_frame, s.end_frame) for s in found]
             confidences = [s.confidence for s in found]
+
+        # Identity is decided on the snap window only. Broadcast film follows
+        # the ball, so a few seconds after the snap the frame is half sideline
+        # and the bench outnumbers the offense. Those frames say nothing useful
+        # about who is playing, and they actively poison the appearance model.
+        window: set[int] = set()
+        for _start, snap_idx, _end in segments:
+            lo = max(0, snap_idx - int(fps * PRE_SNAP_SECONDS))
+            hi = min(len(frames_meta), snap_idx + int(fps * POST_SNAP_SECONDS) + 1)
+            window.update(range(lo, hi))
+        if not window:
+            window = set(range(len(frames_meta)))
+
+        on_field_ids: set[int] = set()
+        for j in window:
+            on_field_ids.update(frames_meta[j]["field_positions"])
+
+        # One appearance decision per track, on the median of its whole life.
+        profiles = build_track_profiles(
+            frames_meta, raw_frames, keep_ids=on_field_ids, frames=window
+        )
+        roster = classify_tracks(profiles)
+        if roster.officials:
+            for meta in frames_meta:
+                meta["tracked"] = [
+                    t for t in meta["tracked"] if t.track_id not in roster.officials
+                ]
+                meta["field_positions"] = {
+                    tid: pos
+                    for tid, pos in meta["field_positions"].items()
+                    if tid not in roster.officials
+                }
 
         plays: list[PlayTracks] = []
         for i, ((start, snap_idx, end), confidence) in enumerate(zip(segments, confidences)):
@@ -193,10 +245,14 @@ class FilmPipeline:
                 j: m["ball"] for j, m in enumerate(frames_meta) if m["ball"] is not None
             }
             snap_idx = refine_with_ball(snap_idx, ball_positions, fps)
+            snap_idx = _refine_with_formation(frames_meta, snap_idx, fps)
+            if len(frames_meta[snap_idx]["field_positions"]) >= 16:
+                confidence = max(confidence, 0.55)
             play = self._build_play(
                 video_path=video_path,
                 frames_meta=frames_meta,
                 raw_frames=raw_frames,
+                roster=roster,
                 start=start,
                 snap_idx=snap_idx,
                 end=end,
@@ -213,6 +269,7 @@ class FilmPipeline:
         video_path: Path,
         frames_meta: list[dict[str, Any]],
         raw_frames: list[np.ndarray],
+        roster: TrackRoster,
         start: int,
         snap_idx: int,
         end: int,
@@ -225,11 +282,7 @@ class FilmPipeline:
         if len(snap_positions) < 10:
             return None
 
-        assignment = assign_teams(
-            raw_frames[min(snap_idx, len(raw_frames) - 1)],
-            snap_meta["tracked"],
-            snap_positions,
-        )
+        assignment = assign_teams_from_roster(roster, snap_positions)
         notes = list(assignment.notes)
 
         if assignment.offense_cluster is None:
@@ -267,12 +320,20 @@ class FilmPipeline:
         direction = self.config.play_direction
         sign = 1.0 if direction == "right" else -1.0
 
-        # Collect each track's observations in normalized coordinates.
+        remaining = max(0.0, (len(frames_meta) - 1 - snap_idx) / max(fps, 1e-6))
+        post = float(min(FILM_POST_SNAP_SECONDS, max(POST_SNAP_SECONDS, remaining)))
+        grid = make_time_grid(PRE_SNAP_SECONDS, post)
+        if grid.shape[0] < N_FRAMES:
+            grid = make_time_grid()
+        snap_index = int(np.argmin(np.abs(grid)))
+
+        # Collect each track's observations in normalized coordinates. Officials
+        # are already gone; `process` stripped them before the snap was found.
         series: dict[int, dict[str, list[float]]] = {}
         for j in range(start, min(end + 1, len(frames_meta))):
             meta = frames_meta[j]
             t = (j - snap_idx) / fps
-            if t < -PRE_SNAP_SECONDS - 0.5 or t > POST_SNAP_SECONDS + 0.5:
+            if t < -PRE_SNAP_SECONDS - 0.5 or t > post + 0.5:
                 continue
             for track_id, (fx, fy) in meta["field_positions"].items():
                 entry = series.setdefault(track_id, {"t": [], "x": [], "y": []})
@@ -282,16 +343,28 @@ class FilmPipeline:
 
         players: list[PlayerTrack] = []
         for track_id, entry in series.items():
+            if len(entry["t"]) < 8:
+                continue
             side = assignment.side_of(track_id)
             if side is None:
                 continue
-            x = resample_to_grid(np.array(entry["t"]), np.array(entry["x"]))
-            y = resample_to_grid(np.array(entry["t"]), np.array(entry["y"]))
+            x = smooth_track(resample_to_grid(np.array(entry["t"]), np.array(entry["x"]), grid=grid))
+            y = smooth_track(resample_to_grid(np.array(entry["t"]), np.array(entry["y"]), grid=grid))
             if not np.isfinite(x).any():
                 continue
+            ys = y[np.isfinite(y)]
+            if ys.size and float(np.median(np.abs(ys))) > 24.0:
+                continue
             players.append(
-                PlayerTrack(track_id=f"{'O' if side == 'offense' else 'D'}_{track_id}", side=side, x=x, y=y)
+                PlayerTrack(
+                    track_id=f"{'O' if side == 'offense' else 'D'}_{track_id}",
+                    side=side,
+                    x=x,
+                    y=y,
+                )
             )
+
+        players = finalize_film_players(players, snap_index=snap_index)
 
         if not players:
             return None
@@ -361,7 +434,94 @@ class FilmPipeline:
             play_direction=direction,
             video_width=int(frame_w),
             video_height=int(frame_h),
+            time_grid=grid,
         )
+
+
+def _formation_spread(positions: dict[int, tuple[float, float]]) -> float:
+    """How far apart the players are in depth. Small means they are still lined up."""
+    if len(positions) < 8:
+        return float("inf")
+    return float(np.std([p[0] for p in positions.values()]))
+
+
+def _refine_with_formation(
+    frames_meta: list[dict[str, Any]],
+    snap_idx: int,
+    fps: float,
+    lookback_s: float = 2.5,
+    lookahead_s: float = 0.15,
+    tolerance: float = 1.15,
+) -> int:
+    """Pull the snap back to the last frame the offense was still in formation.
+
+    Motion energy finds the play, not the snap, and on broadcast film it lands
+    late: the camera zooms as the play develops, so players get bigger, the
+    detector finds more of them, and anything keyed on how *many* players are
+    visible drifts toward the middle of the play. Counting was the old
+    criterion and it put the snap a full second past the handoff.
+
+    Depth spread does not have that bias. Twenty-two players straddling the line
+    are compact in x no matter how far away the camera is, and the snap is the
+    moment that stops being true - so take the last frame that is still within a
+    little of the tightest alignment seen.
+
+    `lookahead_s` is a short settle rather than a search: energy can trip on the
+    last pre-snap shift, and one step of slack covers it. Both it and the
+    tolerance were fitted in scripts/snap_tolerance_study.py against the
+    synthetic clip, the only film where the true snap frame is known exactly.
+    """
+    lo = max(0, snap_idx - int(fps * lookback_s))
+    # A little forward too: motion energy can trip on the last pre-snap shift,
+    # and the snap is then a few frames the other way.
+    hi = min(len(frames_meta) - 1, snap_idx + int(fps * lookahead_s))
+    counts = [len(frames_meta[j]["field_positions"]) for j in range(lo, hi + 1)]
+    if not counts:
+        return snap_idx
+    # Frames where the detector only found a handful look artificially compact.
+    need = max(8, int(0.6 * max(counts)))
+    candidates = [
+        j for j in range(lo, hi + 1) if len(frames_meta[j]["field_positions"]) >= need
+    ]
+    if not candidates:
+        return snap_idx
+
+    spreads = {j: _formation_spread(frames_meta[j]["field_positions"]) for j in candidates}
+    tightest = min(spreads.values())
+    if not np.isfinite(tightest):
+        return snap_idx
+    still_formed = [j for j in candidates if spreads[j] <= tightest * tolerance]
+    return max(still_formed) if still_formed else snap_idx
+
+
+def _on_field(x: float, y: float, margin_x: float = 1.5, margin_y: float = 2.5) -> bool:
+    """Drop crowd and graphics that the homography throws off the turf."""
+    return (
+        -margin_x <= x <= FIELD_LENGTH_YD + margin_x
+        and margin_y <= y <= FIELD_WIDTH_YD - margin_y
+    )
+
+
+def _drop_sideline_isolates(
+    positions: dict[int, tuple[float, float]], band: float = 2.8
+) -> dict[int, tuple[float, float]]:
+    """Officials and the chain gang stand on the paint; receivers do not live there alone."""
+    if len(positions) < 8:
+        return positions
+    kept: dict[int, tuple[float, float]] = {}
+    for tid, (fx, fy) in positions.items():
+        on_paint = fy <= band or fy >= FIELD_WIDTH_YD - band
+        if not on_paint:
+            kept[tid] = (fx, fy)
+            continue
+        nearby = sum(
+            1
+            for ox, oy in positions.values()
+            if abs(ox - fx) <= 8.0 and abs(oy - fy) <= 8.0
+        )
+        if nearby > 2:
+            kept[tid] = (fx, fy)
+    return kept
 
 
 def process_video(

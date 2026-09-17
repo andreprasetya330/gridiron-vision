@@ -29,11 +29,20 @@ class TeamAssignment:
     offense_cluster: int | None = None
     confidence: float = 0.0
     notes: list[str] = field(default_factory=list)
+    centers: np.ndarray | None = None
 
     def side_of(self, track_id: int) -> str | None:
         cluster = self.labels.get(track_id)
         if cluster is None or self.offense_cluster is None:
             return None
+        return "offense" if cluster == self.offense_cluster else "defense"
+
+    def nearest_side(self, feature: np.ndarray) -> str | None:
+        """Assign a player who was not at the snap by Lab distance to the two jerseys."""
+        if self.centers is None or self.offense_cluster is None:
+            return None
+        dist = np.linalg.norm(self.centers - feature.reshape(1, -1), axis=1)
+        cluster = int(np.argmin(dist))
         return "offense" if cluster == self.offense_cluster else "defense"
 
 
@@ -66,6 +75,11 @@ def jersey_feature(frame: np.ndarray, detection: Detection) -> np.ndarray:
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab)
 
     pixels = lab[not_grass] if not_grass.sum() > 20 else lab.reshape(-1, 3)
+    sat = hsv[not_grass][:, 1] if not_grass.sum() > 20 else hsv.reshape(-1, 3)[:, 1]
+    # White numbers and glare pull a red jersey into the white cluster. Keep the
+    # more saturated half of the crop when the jersey actually has colour.
+    if (sat > 50).sum() >= 15:
+        pixels = pixels[sat >= np.median(sat)]
     return np.median(pixels, axis=0).astype(np.float32)
 
 
@@ -74,8 +88,12 @@ def assign_teams(
     tracked: list[Any],
     field_positions: dict[int, tuple[float, float]] | None = None,
 ) -> TeamAssignment:
-    """Cluster players into two teams and identify the offense."""
-    cv2 = require("cv2")
+    """Cluster players into two teams and identify the offense.
+
+    Single-frame clustering, kept for callers that only have one frame. The film
+    pipeline prefers `assign_teams_from_roster`, which clusters the median of a
+    whole track and is far steadier.
+    """
     from sklearn.cluster import KMeans
 
     players = [t for t in tracked if getattr(t.detection, "class_name", "player") == "player"]
@@ -91,7 +109,9 @@ def assign_teams(
     # are wearing similar colours and every downstream number is suspect.
     confidence = float(np.clip((separation - 12.0) / 30.0, 0.0, 1.0))
 
-    assignment = TeamAssignment(labels=labels, confidence=confidence)
+    assignment = TeamAssignment(
+        labels=labels, confidence=confidence, centers=kmeans.cluster_centers_
+    )
     if confidence < 0.35:
         assignment.notes.append(
             f"jersey colours are only {separation:.0f} Lab units apart; team assignment "
@@ -100,6 +120,30 @@ def assign_teams(
 
     if field_positions:
         assignment.offense_cluster = _find_offense(labels, field_positions)
+        if assignment.offense_cluster is None:
+            assignment.notes.append(
+                "could not find an offensive line formation, so offense/defense could "
+                "not be resolved"
+            )
+    return assignment
+
+
+def assign_teams_from_roster(roster: Any, field_positions: dict[int, tuple[float, float]]):
+    """Turn track-level colour labels into an offense/defense assignment.
+
+    Colour says which two groups exist; only geometry says which one is the
+    offense, because no defense ever lines up five abreast on the ball.
+    """
+    assignment = TeamAssignment(
+        labels=dict(roster.team_of),
+        confidence=roster.confidence,
+        centers=roster.centers,
+        notes=list(roster.notes),
+    )
+    if not assignment.labels:
+        return assignment
+    if field_positions:
+        assignment.offense_cluster = _find_offense(assignment.labels, field_positions)
         if assignment.offense_cluster is None:
             assignment.notes.append(
                 "could not find an offensive line formation, so offense/defense could "

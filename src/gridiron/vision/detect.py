@@ -13,9 +13,10 @@ labeling round trip is one command in each direction.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
@@ -59,12 +60,28 @@ class Detection:
 
 @dataclass
 class DetectorConfig:
-    weights: str = "yolov8m.pt"
-    confidence: float = 0.25
+    """Defaults measured on 1080p All-22, not inherited from COCO benchmarks.
+
+    Recall is the ceiling on everything downstream, because a body that is never
+    detected cannot be tracked and a track that dies becomes a new identity. On
+    Sugar Bowl film (scripts/detector_sweep.py), against roughly 26 people on
+    screen, mean kept detections per frame were:
+
+        yolov8m @1280 conf .18 -> 15.4
+        yolo11x @1280 conf .18 -> 20.0
+        yolo11x @1920 conf .10 -> 24.0
+
+    Hence the larger model at native resolution. The low confidence floor is
+    deliberate: BoT-SORT runs a second association pass over low-scoring boxes,
+    so a weak detection is useful evidence rather than noise.
+    """
+
+    weights: str = "yolo11x.pt"
+    confidence: float = 0.15
     iou: float = 0.5
-    image_size: int = 1280  # All-22 is wide; players are small
+    image_size: int = 1920  # All-22 is wide and players are small; do not downscale
     device: str | None = None
-    max_detections: int = 60
+    max_detections: int = 80
     custom_model: bool = False
 
 
@@ -127,11 +144,23 @@ def filter_sideline_detections(
     stands, and anything whose size is wildly out of line with its neighbours at
     similar image height is not on the field. Perspective means a real player's
     apparent height varies smoothly with his y coordinate.
+
+    The outlier gate is deliberately loose. This runs before registration, so it
+    is guessing about the field, while the pipeline's `_on_field` check runs
+    *after* the homography and can reject a body by where it actually stands. A
+    tight gate here was throwing away several real players per frame, and a
+    missing player costs far more than a surviving one that `_on_field` will
+    drop a moment later.
     """
     if not detections:
         return []
 
     keep = [d for d in detections if d.height >= min_height_ratio * frame_height]
+    keep = [
+        d
+        for d in keep
+        if 0.08 * frame_height < d.foot_point[1] < 0.88 * frame_height
+    ]
     if len(keep) < 6:
         return keep
 
@@ -143,7 +172,7 @@ def filter_sideline_detections(
         slope, intercept = np.polyfit(centers_y, heights, 1)
         expected = slope * centers_y + intercept
         residual = np.abs(heights - expected)
-        threshold = max(3.0 * float(np.median(residual)), 0.01 * frame_height)
+        threshold = max(5.0 * float(np.median(residual)), 0.03 * frame_height)
         return [d for d, r in zip(keep, residual) if r <= threshold]
     except Exception:
         return keep
