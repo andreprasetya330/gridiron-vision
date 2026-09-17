@@ -37,9 +37,12 @@ from gridiron.vision import require
 from gridiron.vision.detect import DetectorConfig, PlayerDetector, filter_sideline_detections
 from gridiron.vision.identity import (
     TrackRoster,
+    apply_merges,
+    build_track_embeddings,
     build_track_profiles,
     classify_tracks,
     finalize_film_players,
+    merge_fragments,
 )
 from gridiron.vision.registration import (
     LineRegistrar,
@@ -159,7 +162,7 @@ class FilmPipeline:
             if registration.homography is not None and tracked:
                 foot_points = np.array([t.detection.foot_point for t in tracked])
                 mapped = registration.to_field(foot_points)
-                for t, point in zip(tracked, mapped):
+                for t, point in zip(tracked, mapped, strict=True):
                     if not np.all(np.isfinite(point)):
                         continue
                     fx, fy = float(point[0]), float(point[1])
@@ -189,23 +192,7 @@ class FilmPipeline:
         if not frames_meta:
             return []
 
-        positions_by_frame = [m["field_positions"] for m in frames_meta]
-        energy = motion_energy(positions_by_frame)
-
-        if self.config.single_play:
-            snap = find_snap(energy, fps=fps / max(self.config.stride, 1))
-            if snap is None:
-                snap_indices = [len(frames_meta) // 3]
-                snap_confidence = 0.0
-            else:
-                snap_indices = [snap.frame_index]
-                snap_confidence = snap.confidence
-            segments = [(0, i, len(frames_meta) - 1) for i in snap_indices]
-            confidences = [snap_confidence]
-        else:
-            found = segment_plays(energy, fps=fps / max(self.config.stride, 1))
-            segments = [(s.start_frame, s.snap_frame, s.end_frame) for s in found]
-            confidences = [s.confidence for s in found]
+        segments, confidences = self._find_segments(frames_meta, fps)
 
         # Identity is decided on the snap window only. Broadcast film follows
         # the ball, so a few seconds after the snap the frame is half sideline
@@ -223,11 +210,30 @@ class FilmPipeline:
         for j in window:
             on_field_ids.update(frames_meta[j]["field_positions"])
 
-        # One appearance decision per track, on the median of its whole life.
+        # One appearance decision per track, over its whole life in the window.
         profiles = build_track_profiles(
             frames_meta, raw_frames, keep_ids=on_field_ids, frames=window
         )
-        roster = classify_tracks(profiles)
+        embeddings = build_track_embeddings(
+            frames_meta, raw_frames, keep_ids=on_field_ids, frames=window
+        )
+        roster = classify_tracks(profiles, embeddings)
+
+        # Rejoining fragments needs the team labels, so it has to follow
+        # classification rather than precede it - but the appearance of a track
+        # does not change when it is given a longer life, so the roster stays
+        # valid and only the ids it refers to move.
+        merges = merge_fragments(frames_meta, embeddings, roster, fps)
+        if merges:
+            apply_merges(frames_meta, merges)
+            roster.team_of = {
+                merges.get(tid, tid): team for tid, team in roster.team_of.items()
+            }
+            roster.officials = {merges.get(tid, tid) for tid in roster.officials}
+            roster.notes.append(
+                f"rejoined {len(merges)} track fragment(s) to the player they belong to"
+            )
+
         if roster.officials:
             for meta in frames_meta:
                 meta["tracked"] = [
@@ -238,9 +244,18 @@ class FilmPipeline:
                     for tid, pos in meta["field_positions"].items()
                     if tid not in roster.officials
                 }
+            # That first snap was found with the crowd and the officiating crew
+            # still in the positions. Neither moves with the play, so they flatten
+            # the motion energy the snap is read from - and the more of them the
+            # homography let through, the further off the answer. Now that they
+            # are gone the energy means something different, so ask again rather
+            # than refine a number built on people who are not in the play.
+            segments, confidences = self._find_segments(frames_meta, fps)
 
         plays: list[PlayTracks] = []
-        for i, ((start, snap_idx, end), confidence) in enumerate(zip(segments, confidences)):
+        for i, ((start, snap_idx, end), confidence) in enumerate(
+            zip(segments, confidences, strict=True)
+        ):
             ball_positions = {
                 j: m["ball"] for j, m in enumerate(frames_meta) if m["ball"] is not None
             }
@@ -263,6 +278,25 @@ class FilmPipeline:
             if play is not None:
                 plays.append(play)
         return plays
+
+    def _find_segments(
+        self, frames_meta: list[dict[str, Any]], fps: float
+    ) -> tuple[list[tuple[int, int, int]], list[float]]:
+        """Locate each play's snap from how much the field is moving."""
+        energy = motion_energy([m["field_positions"] for m in frames_meta])
+        rate = fps / max(self.config.stride, 1)
+
+        if not self.config.single_play:
+            found = segment_plays(energy, fps=rate)
+            return (
+                [(s.start_frame, s.snap_frame, s.end_frame) for s in found],
+                [s.confidence for s in found],
+            )
+
+        snap = find_snap(energy, fps=rate)
+        if snap is None:
+            return [(0, len(frames_meta) // 3, len(frames_meta) - 1)], [0.0]
+        return [(0, snap.frame_index, len(frames_meta) - 1)], [snap.confidence]
 
     def _build_play(
         self,

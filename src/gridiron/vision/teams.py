@@ -152,22 +152,32 @@ def assign_teams_from_roster(roster: Any, field_positions: dict[int, tuple[float
     return assignment
 
 
+# Depth a formation occupies, in yards, measured between its 10th and 90th
+# percentile. An offense is a shallow thing - seven on the line, nobody deeper
+# than the tailback - while a defense keeps safeties ten or more yards off it.
+OFFENSE_MAX_DEPTH_YD = 8.0
+# Below this difference the two sides are not telling us apart by depth alone.
+DEPTH_MARGIN_YD = 3.0
+
+
 def _find_offense(
     labels: dict[int, int], field_positions: dict[int, tuple[float, float]]
 ) -> int | None:
-    """The offense is the side whose five most depth-packed players form a wide line.
+    """The offense is the shallower of the two formations.
 
-    Searching for five consecutive players along the sideline (y) looks right and
-    is not: the quarterback and the backs stand in the gaps of the offensive line,
-    so that window is the line plus the backfield and its depth span is six yards.
-    An absolute cutoff of four yards then rejects the true offense on most snaps.
+    Looking for the more line-like five players cannot settle this, because a
+    defensive front is also five players sharing a depth, and on film where the
+    offense is partly missed the defense's front scores better than the real
+    offensive line. Measured across the pre-snap frames of the Sugar Bowl clip,
+    line-likeness picked the defense on nearly every frame.
 
-    Searching along depth (x) instead finds the five players who already share an
-    x, and the one that is also wide is the line. A stacked backfield is tight in
-    both directions; a defensive front is wider but not as shallow. The relative
-    score is what decides, not a magic number of yards.
+    Depth is not close. The offense spanned three to five yards on every one of
+    those frames and the defense ten to thirteen, because the secondary has to
+    play off the ball and the backfield does not. Line-likeness is kept only for
+    the case where both sides really are equally shallow - goal line, say - where
+    the depth reading has nothing to say.
     """
-    scored: list[tuple[float, int]] = []
+    measured: list[tuple[int, float, float]] = []
     for cluster in (0, 1):
         points = [
             field_positions[tid]
@@ -177,11 +187,21 @@ def _find_offense(
         window = _line_window(points)
         if window is None:
             continue
-        scored.append((_line_score(window), cluster))
-    if not scored:
+        depth = np.array(points)[:, 0]
+        # Percentiles rather than the full range: one blown coverage or one
+        # badly mapped foot point should not redefine the formation.
+        extent = float(np.percentile(depth, 90) - np.percentile(depth, 10))
+        measured.append((cluster, extent, _line_score(window)))
+
+    if not measured:
         return None
-    scored.sort()
-    return scored[0][1]
+    if len(measured) == 1:
+        return measured[0][0]
+
+    first, second = measured
+    if abs(first[1] - second[1]) >= DEPTH_MARGIN_YD:
+        return first[0] if first[1] < second[1] else second[0]
+    return first[0] if first[2] <= second[2] else second[0]
 
 
 def _line_window(points: list[tuple[float, float]]) -> np.ndarray | None:

@@ -103,6 +103,89 @@ def test_teams_survive_a_stadium_shadow_across_the_field():
     assert len(first) == 1 and len(second) == 1 and first != second
 
 
+def _embedding(seed: int, centre: np.ndarray, jitter: float = 0.05) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    vec = centre + rng.normal(0.0, jitter, size=centre.shape)
+    return (vec / np.linalg.norm(vec)).astype(np.float32)
+
+
+def test_embeddings_outrank_colour_when_both_are_present():
+    """Colour says one thing, appearance says another; appearance wins."""
+    dim = 32
+    home = np.zeros(dim, dtype=np.float32)
+    home[0] = 1.0
+    away = np.zeros(dim, dtype=np.float32)
+    away[1] = 1.0
+
+    profiles, embeddings = {}, {}
+    for i in range(11):  # colour is deliberately uninformative here
+        profiles[i] = _profile(i, 100.0, -4, 6)
+        embeddings[i] = _embedding(i, home)
+    for i in range(11, 22):
+        profiles[i] = _profile(i, 100.0, -4, 6)
+        embeddings[i] = _embedding(i, away)
+
+    roster = classify_tracks(profiles, embeddings)
+    first = {roster.team_of[i] for i in range(11)}
+    second = {roster.team_of[i] for i in range(11, 22)}
+    assert len(first) == 1 and len(second) == 1 and first != second
+
+
+def _squads(dim: int = 32, crew: int = 3, gap: float = 1.0):
+    """Two teams that look somewhat alike, plus a crew that looks like neither.
+
+    The teams share a component because two sets of padded players on grass are
+    genuinely more similar to each other than either is to an official - that
+    resemblance is what the outsider test measures against.
+    """
+    shared = np.zeros(dim, dtype=np.float32)
+    shared[0] = 1.0
+    home, away = shared.copy(), shared.copy()
+    home[1], away[2] = 0.35, 0.35
+    officials = np.zeros(dim, dtype=np.float32)
+    officials[3] = gap
+
+    profiles, embeddings = {}, {}
+    for i in range(11):
+        profiles[i], embeddings[i] = _profile(i, 100.0), _embedding(i, home)
+    for i in range(11, 22):
+        profiles[i], embeddings[i] = _profile(i, 100.0), _embedding(i, away)
+    for i in range(22, 22 + crew):
+        profiles[i], embeddings[i] = _profile(i, 30.0), _embedding(i, officials)
+    return profiles, embeddings
+
+
+def test_a_group_that_looks_like_neither_team_is_dropped():
+    profiles, embeddings = _squads(crew=3)
+    roster = classify_tracks(profiles, embeddings)
+
+    assert roster.officials == {22, 23, 24}
+    assert set(roster.team_of) == set(range(22))
+    first = {roster.team_of[i] for i in range(11)}
+    second = {roster.team_of[i] for i in range(11, 22)}
+    assert len(first) == 1 and len(second) == 1 and first != second
+
+
+def test_two_clean_teams_lose_nobody():
+    """No crew on screen means no track should be discarded."""
+    profiles, embeddings = _squads(crew=0)
+    roster = classify_tracks(profiles, embeddings)
+
+    assert roster.officials == set()
+    assert len(roster.team_of) == 22
+    first = {roster.team_of[i] for i in range(11)}
+    second = {roster.team_of[i] for i in range(11, 22)}
+    assert len(first) == 1 and len(second) == 1 and first != second
+
+
+def test_a_crew_too_large_to_be_a_crew_is_not_discarded():
+    """Rather than throw away a quarter of the film, defer to colour."""
+    profiles, embeddings = _squads(crew=11)
+    roster = classify_tracks(profiles, embeddings)
+
+    assert roster.officials == set()
+
+
 def test_no_gap_means_no_official_is_invented():
     """A clip with no crew on screen must not donate a dark player to the gap."""
     profiles = {i: _profile(i, 70.0 + 4.0 * i, -14, 20) for i in range(11)}

@@ -96,6 +96,38 @@ def test_backs_in_the_line_gaps_do_not_hide_the_offense():
     assert estimate_line_of_scrimmage(positions, labels, 0) == pytest.approx(0.0, abs=0.1)
 
 
+def test_a_deep_secondary_marks_the_defense_even_with_a_tidier_front():
+    """The shape that used to pick the wrong side on real film.
+
+    Half the offense goes undetected, so what is left of it is ragged, while the
+    defensive front is a clean five across. Line-likeness prefers the defense
+    here; only the safeties standing twelve yards off the ball settle it.
+    """
+    positions = {}
+    labels = {}
+    # What survived of the offense: a broken line and a back, all near the ball.
+    for i, (x, y) in enumerate([(0.0, -6), (0.4, -1.0), (0.0, 3), (-0.5, 6), (-4.5, 0)]):
+        positions[i] = (x, y)
+        labels[i] = 0
+    # The defense: a textbook front, plus two safeties and a corner playing off.
+    for i, (x, y) in enumerate(
+        [
+            (1.5, -6),
+            (1.5, -2),
+            (1.5, 2),
+            (1.5, 6),
+            (5.0, 0),
+            (12.0, -9),
+            (12.5, 9),
+            (11.0, 20),
+        ]
+    ):
+        positions[20 + i] = (x, y)
+        labels[20 + i] = 1
+
+    assert _find_offense(labels, positions) == 0
+
+
 def test_side_of_follows_the_offense_cluster():
     assignment = TeamAssignment(labels={1: 0, 2: 1}, offense_cluster=0)
     assert assignment.side_of(1) == "offense"

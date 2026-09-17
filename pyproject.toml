@@ -44,6 +44,7 @@ vision = [
     # degrades quality silently rather than failing - hence the ceiling.
     "supervision>=0.23,<0.31",
     "torchvision>=0.24",
+    "transformers>=4.45",
 ]
 dev = [
     "pytest>=8.3",
