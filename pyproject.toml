@@ -37,6 +37,7 @@ dependencies = [
 # only needed once you are actually processing film.
 vision = [
     "opencv-python>=4.10",
+    "inference-sdk>=1.5",
     "ultralytics>=8.3",
     # ByteTrack is deprecated in supervision 0.28 and removed in 0.31, and it is
     # the only tracker here that handles crossing players well. build_tracker

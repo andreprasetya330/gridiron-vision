@@ -66,6 +66,8 @@ class PipelineConfig:
     max_frames: int | None = None
     single_play: bool = True  # a Hudl-style cutup with one snap
     play_direction: str = "right"
+    # auto: Roboflow when an API key is present and no detector/registrar is injected.
+    backend: str = "auto"
 
 
 def read_frames(
@@ -100,21 +102,52 @@ def video_fps(video_path: Path) -> float:
     return float(fps)
 
 
+class _DetRef:
+    def __init__(self, confidence: float) -> None:
+        self.confidence = confidence
+
+
+class _TrackedRef:
+    def __init__(self, track_id: int, confidence: float) -> None:
+        self.track_id = track_id
+        self.detection = _DetRef(confidence)
+
+
 class FilmPipeline:
     def __init__(
         self,
         config: PipelineConfig | None = None,
         detector: Any | None = None,
         registrar: Any | None = None,
+        workflow: Any | None = None,
     ) -> None:
         self.config = config or PipelineConfig()
         # Both stages are injectable so the pipeline can be validated against
         # known ground truth with one stage swapped out at a time. Isolating a
         # failure to detection, registration, or the geometry between them is
         # otherwise guesswork.
-        self.detector = detector if detector is not None else PlayerDetector(self.config.detector)
+        self._injected_detector = detector
         self._injected_registrar = registrar
+        self._workflow = workflow
+        self.predictions: list[dict[str, Any]] = []
         self.spec = get_field(self.config.league)
+        if detector is not None:
+            self.detector = detector
+        elif self._uses_local_backend():
+            self.detector = PlayerDetector(self.config.detector)
+        else:
+            self.detector = None
+
+    def _uses_local_backend(self) -> bool:
+        if self._injected_detector is not None or self._injected_registrar is not None:
+            return True
+        if self.config.backend == "local":
+            return True
+        if self.config.backend == "roboflow":
+            return False
+        from gridiron.config import RoboflowSettings
+
+        return not RoboflowSettings().enabled
 
     def _registrar(self):
         if self._injected_registrar is not None:
@@ -127,6 +160,14 @@ class FilmPipeline:
 
     def process(self, video_path: Path, play_id: str | None = None) -> list[PlayTracks]:
         video_path = Path(video_path)
+        self.predictions = []
+        if video_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+            return self._process_image(video_path, play_id=play_id)
+        if not self._uses_local_backend():
+            return self._process_roboflow(video_path, play_id=play_id)
+        return self._process_local(video_path, play_id=play_id)
+
+    def _process_local(self, video_path: Path, play_id: str | None = None) -> list[PlayTracks]:
         fps = video_fps(video_path)
         registrar = self._registrar()
         smoother = SmoothedRegistration()
@@ -279,6 +320,134 @@ class FilmPipeline:
                 plays.append(play)
         return plays
 
+    def _workflow_client(self):
+        if self._workflow is not None:
+            return self._workflow
+        from gridiron.vision.roboflow import WorkflowClient
+
+        self._workflow = WorkflowClient()
+        return self._workflow
+
+    def _process_image(self, image_path: Path, play_id: str | None = None) -> list[PlayTracks]:
+        cv2 = require("cv2")
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            raise FileNotFoundError(f"could not open image: {image_path}")
+        result = self._workflow_client().run_frame(frame)
+        return self._plays_from_workflow_frames(
+            source_path=image_path,
+            frames=[(0, frame, result)],
+            fps=10.0,
+            play_id=play_id or image_path.stem,
+        )
+
+    def _process_roboflow(self, video_path: Path, play_id: str | None = None) -> list[PlayTracks]:
+        fps = video_fps(video_path)
+        client = self._workflow_client()
+        frames: list[tuple[int, np.ndarray, Any]] = []
+        for frame_index, frame in read_frames(
+            video_path, self.config.stride, self.config.max_frames
+        ):
+            frames.append((frame_index, frame, client.run_frame(frame)))
+        if not frames:
+            return []
+        return self._plays_from_workflow_frames(
+            source_path=video_path,
+            frames=frames,
+            fps=fps / max(self.config.stride, 1),
+            play_id=play_id,
+        )
+
+    def _plays_from_workflow_frames(
+        self,
+        source_path: Path,
+        frames: list[tuple[int, np.ndarray, Any]],
+        fps: float,
+        play_id: str | None,
+    ) -> list[PlayTracks]:
+        from gridiron.vision.registration import Registration
+        from gridiron.vision.roboflow import coverage_prediction_row
+
+        frames_meta: list[dict[str, Any]] = []
+        raw_frames: list[np.ndarray] = []
+        prev_positions: dict[int, tuple[float, float]] = {}
+        prev_sides: dict[int, str] = {}
+        next_id = 1
+
+        for frame_index, frame, parsed in frames:
+            assigned, next_id = _associate_field_players(
+                parsed.players, prev_positions, prev_sides, next_id
+            )
+            field_positions = {
+                tid: (player.field_x, player.field_y) for tid, player in assigned.items()
+            }
+            sides = {tid: player.side for tid, player in assigned.items() if player.side}
+            homography = np.asarray(parsed.homography, dtype=np.float64) if parsed.homography else None
+            registration = Registration(
+                homography=homography,
+                method="roboflow-uga",
+                reprojection_error_yd=1.5,
+                notes=list(parsed.notes),
+            )
+            frames_meta.append(
+                {
+                    "frame_index": frame_index,
+                    "tracked": [
+                        _TrackedRef(tid, player.confidence) for tid, player in assigned.items()
+                    ],
+                    "field_positions": field_positions,
+                    "sides": sides,
+                    "registration": registration,
+                    "ball": None,
+                    "n_detections": len(assigned),
+                    "notes": list(parsed.notes),
+                    "coverage": parsed.coverage,
+                    "parsed": parsed,
+                }
+            )
+            raw_frames.append(frame)
+            prev_positions = field_positions
+            prev_sides = {tid: side for tid, side in sides.items() if side}
+
+        if not frames_meta:
+            return []
+
+        segments, confidences = self._find_segments(frames_meta, fps * max(self.config.stride, 1))
+        empty_roster = TrackRoster()
+        plays: list[PlayTracks] = []
+        for i, ((start, snap_idx, end), confidence) in enumerate(
+            zip(segments, confidences, strict=True)
+        ):
+            this_id = play_id or f"{source_path.stem}-{i:03d}"
+            play = self._build_play(
+                video_path=source_path,
+                frames_meta=frames_meta,
+                raw_frames=raw_frames,
+                roster=empty_roster,
+                start=start,
+                snap_idx=snap_idx,
+                end=end,
+                fps=fps,
+                snap_confidence=max(confidence, 0.5),
+                play_id=this_id,
+            )
+            if play is None:
+                continue
+            snap_parsed = frames_meta[min(snap_idx, len(frames_meta) - 1)].get("parsed")
+            if snap_parsed is not None:
+                _save_workflow_overlays(this_id, snap_parsed)
+                if snap_parsed.coverage.coverage:
+                    self.predictions.append(
+                        coverage_prediction_row(
+                            this_id,
+                            snap_parsed.coverage,
+                            quality_score=play.quality.score,
+                            usable=play.quality.usable,
+                        )
+                    )
+            plays.append(play)
+        return plays
+
     def _find_segments(
         self, frames_meta: list[dict[str, Any]], fps: float
     ) -> tuple[list[tuple[int, int, int]], list[float]]:
@@ -316,8 +485,22 @@ class FilmPipeline:
         if len(snap_positions) < 10:
             return None
 
-        assignment = assign_teams_from_roster(roster, snap_positions)
-        notes = list(assignment.notes)
+        labeled_sides: dict[int, str] = {}
+        for meta in frames_meta[start : min(end + 1, len(frames_meta))]:
+            labeled_sides.update(meta.get("sides") or {})
+        snap_sides = {
+            tid: labeled_sides[tid] for tid in snap_positions if tid in labeled_sides
+        }
+
+        if snap_sides:
+            from gridiron.vision.teams import TeamAssignment
+
+            labels = {tid: 0 if side == "offense" else 1 for tid, side in snap_sides.items()}
+            assignment = TeamAssignment(labels=labels, offense_cluster=0, notes=[])
+            notes = list(snap_meta.get("notes") or [])
+        else:
+            assignment = assign_teams_from_roster(roster, snap_positions)
+            notes = list(assignment.notes)
 
         if assignment.offense_cluster is None:
             # Colour clustering produced two groups, but neither looks like a
@@ -366,7 +549,7 @@ class FilmPipeline:
         series: dict[int, dict[str, list[float]]] = {}
         for j in range(start, min(end + 1, len(frames_meta))):
             meta = frames_meta[j]
-            t = (j - snap_idx) / fps
+            t = (j - snap_idx) / max(fps, 1e-6)
             if t < -PRE_SNAP_SECONDS - 0.5 or t > post + 0.5:
                 continue
             for track_id, (fx, fy) in meta["field_positions"].items():
@@ -375,9 +558,21 @@ class FilmPipeline:
                 entry["x"].append(sign * (fx - los_x))
                 entry["y"].append(sign * (fy - ball_y))
 
+        still = len(frames_meta) == 1
+        if still:
+            notes.append("still frame: formation is held at the snap, so velocities are zero")
+            ticks = [round(float(t), 2) for t in np.arange(-PRE_SNAP_SECONDS, 0.01, 0.1)]
+            for entry in series.values():
+                if entry["t"]:
+                    x0, y0 = entry["x"][0], entry["y"][0]
+                    entry["t"] = ticks
+                    entry["x"] = [x0] * len(ticks)
+                    entry["y"] = [y0] * len(ticks)
+
         players: list[PlayerTrack] = []
+        min_obs = 1 if still else 8
         for track_id, entry in series.items():
-            if len(entry["t"]) < 8:
+            if len(entry["t"]) < min_obs:
                 continue
             side = assignment.side_of(track_id)
             if side is None:
@@ -460,7 +655,7 @@ class FilmPipeline:
             situation=situation,
             quality=quality,
             video_path=str(video_path),
-            snap_frame_in_video=snap_idx,
+            snap_frame_in_video=int(snap_meta.get("frame_index", snap_idx)),
             video_fps=fps,
             homography=homography,
             origin_x=float(los_x),
@@ -558,13 +753,54 @@ def _drop_sideline_isolates(
     return kept
 
 
+def _associate_field_players(
+    players: list[Any],
+    prev_positions: dict[int, tuple[float, float]],
+    prev_sides: dict[int, str],
+    next_id: int,
+    max_yards: float = 6.0,
+) -> tuple[dict[int, Any], int]:
+    """Greedy nearest-neighbor IDs on field yards, staying on the same side."""
+    unused = set(prev_positions)
+    assigned: dict[int, Any] = {}
+    for player in players:
+        best_id = None
+        best_dist = max_yards
+        for tid in unused:
+            if prev_sides.get(tid) and player.side and prev_sides[tid] != player.side:
+                continue
+            px, py = prev_positions[tid]
+            dist = float(np.hypot(player.field_x - px, player.field_y - py))
+            if dist < best_dist:
+                best_id = tid
+                best_dist = dist
+        if best_id is None:
+            best_id = next_id
+            next_id += 1
+        else:
+            unused.remove(best_id)
+        assigned[best_id] = player
+    return assigned, next_id
+
+
+def _save_workflow_overlays(play_id: str, parsed: Any) -> None:
+    from gridiron.config import subdir
+
+    folder = subdir("film", "overlays")
+    if getattr(parsed, "minimap_png", None):
+        (folder / f"{play_id}_minimap.png").write_bytes(parsed.minimap_png)
+    if getattr(parsed, "output_png", None):
+        (folder / f"{play_id}_output.png").write_bytes(parsed.output_png)
+
+
 def process_video(
     video_path: Path,
     config: PipelineConfig | None = None,
     play_id: str | None = None,
     detector: Any | None = None,
     registrar: Any | None = None,
+    workflow: Any | None = None,
 ) -> list[PlayTracks]:
-    return FilmPipeline(config, detector=detector, registrar=registrar).process(
-        video_path, play_id=play_id
-    )
+    return FilmPipeline(
+        config, detector=detector, registrar=registrar, workflow=workflow
+    ).process(video_path, play_id=play_id)

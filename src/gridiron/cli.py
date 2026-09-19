@@ -77,18 +77,25 @@ def doctor() -> None:
         ("cv2", "opencv"),
         ("ultralytics", "ultralytics"),
         ("supervision", "supervision"),
+        ("inference_sdk", "inference-sdk"),
         ("shap", "shap"),
     ):
         try:
             __import__(module)
             table.add_row(label, "[green]installed[/green]")
         except ImportError:
-            hint = " (uv sync --extra vision)" if module in ("cv2", "ultralytics", "supervision") else ""
+            hint = " (uv sync --extra vision)" if module in ("cv2", "ultralytics", "supervision", "inference_sdk") else ""
             table.add_row(label, f"[yellow]missing[/yellow]{hint}")
 
     import os
 
     table.add_row("CFBD_API_KEY", "set" if os.environ.get("CFBD_API_KEY") else "[yellow]not set[/yellow]")
+    from gridiron.config import RoboflowSettings
+
+    rf = RoboflowSettings()
+    table.add_row("ROBOFLOW_API_KEY", "set" if rf.api_key else "[yellow]not set[/yellow]")
+    if rf.api_key:
+        table.add_row("Roboflow workflow", f"{rf.workspace}/{rf.workflow_id}")
     try:
         from gridiron.ingest.cfbd import CFBDClient, CFBDConfig
 
@@ -472,17 +479,37 @@ def train_net_command(
 
 @film_app.command("process")
 def film_process(
-    video: Path = typer.Argument(..., help="Path to an MP4"),
+    video: Path = typer.Argument(..., help="Path to an MP4 or a still image"),
     league: str = typer.Option("ncaa"),
     single_play: bool = typer.Option(True, help="Treat the clip as one play"),
-    stride: int = typer.Option(1),
+    stride: Optional[int] = typer.Option(
+        None, help="Process every Nth frame. Default 3 for Roboflow, 1 for local."
+    ),
+    backend: str = typer.Option(
+        "auto",
+        help="Film backend: auto (Roboflow when ROBOFLOW_API_KEY is set), roboflow, or local",
+    ),
 ) -> None:
-    """Turn film into per-play tracking JSON."""
+    """Turn film into per-play tracking JSON via the Roboflow coverage workflow."""
+    from gridiron.coverage.bridge import upsert_predictions
     from gridiron.tracking.schema import save_plays
-    from gridiron.vision.pipeline import PipelineConfig, process_video
+    from gridiron.vision.pipeline import FilmPipeline, PipelineConfig
 
-    config = PipelineConfig(league=league, single_play=single_play, stride=stride)
-    plays = process_video(video, config)
+    resolved_stride = stride
+    if resolved_stride is None:
+        from gridiron.config import RoboflowSettings
+
+        uses_hosted = backend != "local" and RoboflowSettings().enabled
+        resolved_stride = 3 if uses_hosted else 1
+
+    config = PipelineConfig(
+        league=league,
+        single_play=single_play,
+        stride=resolved_stride,
+        backend=backend,
+    )
+    pipeline = FilmPipeline(config)
+    plays = pipeline.process(video)
     if not plays:
         console.print(
             "[yellow]no usable plays extracted. Common causes: the homography could "
@@ -490,10 +517,17 @@ def film_process(
         )
         raise typer.Exit(1)
 
-    n = save_plays(plays, cfg.plays_dir("film"))
+    out_dir = cfg.plays_dir("film")
+    n = save_plays(plays, out_dir)
+    if pipeline.predictions:
+        pred_path = upsert_predictions(pipeline.predictions, cfg.predictions_path())
+        console.print(f"wrote {len(pipeline.predictions)} workflow coverage call(s) to {pred_path}")
     for play in plays:
+        rushers = sum(1 for p in play.players if p.role == "blitz")
         console.print(
             f"{play.play_id}: {play.quality.defenders_detected} defenders, "
+            f"{rushers} rushers, snap {play.snap_frame_in_video}, "
+            f"{len(play.time_grid)} ticks, "
             f"registration error {play.quality.registration_error_yd:.2f} yd, "
             f"quality {play.quality.score:.2f}"
         )

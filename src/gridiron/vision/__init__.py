@@ -7,7 +7,7 @@ large tree that the analytics half of the project does not need.
 
 VISION_EXTRA_HINT = (
     "Vision dependencies are not installed. Run `uv sync --extra vision` to add "
-    "opencv-python, ultralytics, and supervision."
+    "opencv-python, inference-sdk, ultralytics, and supervision."
 )
 
 

@@ -117,6 +117,35 @@ def db_path() -> Path:
     return data_dir() / "gridiron.duckdb"
 
 
+class RoboflowSettings:
+    """Hosted film workflow: player detection, UGA-calibrated minimap, coverage class.
+
+    The homography inside the workflow is locked to one camera view. Other
+    angles need a new calibration polygon; do not treat coordinates from a
+    different shot as interchangeable with this one.
+    """
+
+    def __init__(self) -> None:
+        self.api_key = os.environ.get("ROBOFLOW_API_KEY", "").strip()
+        self.api_url = os.environ.get(
+            "ROBOFLOW_API_URL", "https://serverless.roboflow.com"
+        ).strip()
+        self.workspace = os.environ.get("ROBOFLOW_WORKSPACE", "andre-4cotb").strip()
+        self.workflow_id = os.environ.get(
+            "ROBOFLOW_WORKFLOW_ID", "defensive-coverage-analysis-1789781275490"
+        ).strip()
+        self.use_cache = os.environ.get("ROBOFLOW_USE_CACHE", "1").strip() not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key and self.workspace and self.workflow_id)
+
+
 class LLMSettings:
     """Optional LLM used only for narrative prose in scouting reports.
 

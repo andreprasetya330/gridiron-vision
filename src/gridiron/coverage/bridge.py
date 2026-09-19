@@ -241,3 +241,21 @@ def write_predictions(predictions: list[dict], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(predictions, indent=2), encoding="utf-8")
     return path
+
+
+def upsert_predictions(predictions: list[dict], path: Path) -> Path:
+    """Replace rows that share a play_id; leave the rest of the overlay file alone."""
+    import json
+
+    path = Path(path)
+    existing: list[dict] = []
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            existing = raw
+    by_id = {row.get("play_id"): row for row in existing if row.get("play_id")}
+    for row in predictions:
+        play_id = row.get("play_id")
+        if play_id:
+            by_id[play_id] = row
+    return write_predictions(list(by_id.values()), path)
