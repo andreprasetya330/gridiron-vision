@@ -1,3 +1,7 @@
+# Broadcast stills used for local Workflow smoke tests
+uga-play.jpg
+coverage_test_out/
+
 # Data and models are never committed
 data/
 models/
