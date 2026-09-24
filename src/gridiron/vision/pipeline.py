@@ -366,7 +366,6 @@ class FilmPipeline:
         play_id: str | None,
     ) -> list[PlayTracks]:
         from gridiron.vision.registration import Registration
-        from gridiron.vision.roboflow import coverage_prediction_row
 
         frames_meta: list[dict[str, Any]] = []
         raw_frames: list[np.ndarray] = []
@@ -436,15 +435,6 @@ class FilmPipeline:
             snap_parsed = frames_meta[min(snap_idx, len(frames_meta) - 1)].get("parsed")
             if snap_parsed is not None:
                 _save_workflow_overlays(this_id, snap_parsed)
-                if snap_parsed.coverage.coverage:
-                    self.predictions.append(
-                        coverage_prediction_row(
-                            this_id,
-                            snap_parsed.coverage,
-                            quality_score=play.quality.score,
-                            usable=play.quality.usable,
-                        )
-                    )
             plays.append(play)
         return plays
 

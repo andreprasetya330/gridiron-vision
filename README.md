@@ -7,13 +7,12 @@ produced it.
 
 ## The idea
 
-Do not predict coverage from tracking data alone when you already have a hosted
-film workflow. For **Big Data Bowl / synthetic** plays the coverage model still
-reads tracks. For **film**, `gridiron film process` now calls the Roboflow
-workflow (`defensive-coverage-analysis`) which detects players, projects them
-through a UGA-calibrated homography, and returns an experimental coverage class
-from the minimap. That call is a baseline — not coach-validated — and the
-homography is locked to one camera view.
+Split vision from coverage. **Roboflow detects players** and the UGA homography
+graphs them onto a bird's-eye minimap. Those points become `PlayTracks`. **The
+Big Data Bowl coverage model** then reads the points — the same model trained on
+NFL tracking — rather than the hosted Qwen image classifier. A still is scored as
+a pre-snap look; a video clip gets the post-snap call plus disguise. The
+homography is locked to the UGA camera view.
 
 Everything downstream consumes one JSON contract (`PlayTracks`), so film, a Hudl export, or a
 PFF export all describe the same thing.
@@ -51,7 +50,7 @@ data over synthetic.
 | `gridiron bdb build` | Normalize BDB into `data/plays/bdb/` and persist league coverage rates |
 | `gridiron train baseline` | Gradient boosting on engineered features (`--source auto\|bdb\|synthetic\|film`) |
 | `gridiron train net` | Set-transformer over the 22 tracks + per-defender role head |
-| `gridiron film process <video-or-image>` | Roboflow workflow → per-play tracking JSON + coverage prediction |
+| `gridiron film process <video-or-image>` | Roboflow player detect → minimap points → BDB coverage model |
 | `gridiron film evaluate` | Score detection and tracking against corpus ground truth |
 | `gridiron film bridge` | Measure how much accuracy the camera costs the coverage model |
 | `gridiron film finetune <data.yaml>` | Fine-tune the player detector |

@@ -1,15 +1,16 @@
-"""Roboflow hosted workflow as the film vision backend.
+"""Roboflow player detection plus a local UGA minimap.
 
-The saved workflow (`defensive-coverage-analysis-...`) does three jobs that
-used to be local YOLO + line registration + a tracking-data coverage model:
+The hosted player workflow (`american-football-player-trackin`) finds
+`offense_player` / `defense_player` / `official`. Feet are projected through the
+UGA-broadcast homography onto a 120-yard minimap, then converted to `PlayTracks`
+so the Big Data Bowl coverage model can score the points.
 
-1. Detect `offense_player` / `defense_player` / `official`
-2. Project feet through a UGA-broadcast homography onto a 120-yard minimap
-3. Classify the shell from that minimap
+The full `defensive-coverage-analysis` workflow also runs a Qwen coverage
+identifier on the minimap image. That path is opt-in (`ROBOFLOW_DETECT_ONLY=0`)
+because it is not the BDB track model and is not coach-validated.
 
 The homography is calibrated to one camera. Other pans, zooms, or venues need
-a new polygon (or automatic landmark registration). Coverage labels from the
-workflow are an experimental baseline, not a coach-validated call.
+a new polygon (or automatic landmark registration).
 """
 
 from __future__ import annotations
@@ -370,6 +371,116 @@ def parse_workflow_result(result: Any, image_size: tuple[int, int] | None = None
     )
 
 
+def field_players_from_detections(
+    detections: list[dict[str, Any]],
+    image_width: int | None,
+    image_height: int | None,
+) -> list[FieldPlayer]:
+    """Project player feet through the UGA homography onto field yards / minimap."""
+    cv2 = require("cv2")
+    H = image_to_field_homography(image_width, image_height)
+    players: list[FieldPlayer] = []
+    for det in detections:
+        class_name = str(det.get("class") or det.get("class_name") or "player")
+        if "official" in class_name.lower() or "referee" in class_name.lower():
+            continue
+        box = _box_xyxy(det)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        foot = np.asarray([[[ (x1 + x2) / 2.0, y2 ]]], dtype=np.float32)
+        mapped = cv2.perspectiveTransform(foot, H)[0, 0]
+        fx, fy = float(mapped[0]), float(mapped[1])
+        mx, my = fx * PX_PER_YD, fy * PX_PER_YD
+        if not (0 <= mx < MINIMAP_WIDTH_PX and 0 <= my < MINIMAP_HEIGHT_PX):
+            continue
+        players.append(
+            FieldPlayer(
+                class_name=class_name,
+                field_x=fx,
+                field_y=fy,
+                minimap_x=mx,
+                minimap_y=my,
+                confidence=float(det.get("confidence") or 0.0),
+                image_box=box,
+            )
+        )
+    return players
+
+
+def _box_xyxy(det: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    if {"x1", "y1", "x2", "y2"} <= det.keys():
+        return float(det["x1"]), float(det["y1"]), float(det["x2"]), float(det["y2"])
+    if {"x", "y", "width", "height"} <= det.keys():
+        cx, cy = float(det["x"]), float(det["y"])
+        w, h = float(det["width"]), float(det["height"])
+        return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+    return None
+
+
+def render_minimap(players: list[FieldPlayer]) -> bytes | None:
+    """Bird's-eye PNG matching the hosted Football_Field_Minimap block."""
+    try:
+        cv2 = require("cv2")
+    except ImportError:
+        return None
+    w, h, ez = MINIMAP_WIDTH_PX, MINIMAP_HEIGHT_PX, ENDZONE_PX
+    canvas = np.full((h, w, 3), (42, 120, 42), dtype=np.uint8)
+    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (255, 255, 255), 4)
+    cv2.line(canvas, (ez, 0), (ez, h), (255, 255, 255), 4)
+    cv2.line(canvas, (w - ez, 0), (w - ez, h), (255, 255, 255), 4)
+    for x in range(ez, w - ez + 1, 50):
+        cv2.line(
+            canvas,
+            (x, 0),
+            (x, h),
+            (220, 235, 220),
+            3 if (x - ez) % 100 == 0 else 1,
+        )
+    colors = {
+        "offense_player": (255, 80, 40),
+        "defense_player": (40, 60, 255),
+        "official": (245, 245, 245),
+    }
+    for player in players:
+        x, y = int(round(player.minimap_x)), int(round(player.minimap_y))
+        color = colors.get(player.class_name, (0, 215, 255))
+        cv2.circle(canvas, (x, y), 11, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 13, (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "OFFENSE", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 40), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "DEFENSE", (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 60, 255), 2, cv2.LINE_AA)
+    ok, encoded = cv2.imencode(".png", canvas)
+    return encoded.tobytes() if ok else None
+
+
+def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) -> WorkflowFrame:
+    """Player-detection workflow → field points + local minimap. No Qwen call."""
+    payload = _unwrap_result(result)
+    detections, det_w, det_h = _detection_rows(payload.get("predictions", payload))
+    width = det_w or (image_size[0] if image_size else None)
+    height = det_h or (image_size[1] if image_size else None)
+    notes = [UGA_CALIBRATION_NOTE]
+    homography = None
+    try:
+        H = image_to_field_homography(width, height)
+        homography = H.tolist()
+        players = field_players_from_detections(detections, width, height)
+    except Exception as exc:
+        notes.append(f"could not project detections onto the field: {exc}")
+        players = []
+    return WorkflowFrame(
+        coverage=CoverageCall(coverage=None, confidence=0.0, probabilities={c: 0.0 for c in COVERAGES}),
+        players=players,
+        homography=homography,
+        image_width=width,
+        image_height=height,
+        minimap_png=render_minimap(players),
+        output_png=None,
+        notes=notes,
+        raw={"predictions": detections},
+    )
+
+
 def coverage_prediction_row(
     play_id: str,
     call: CoverageCall,
@@ -425,10 +536,20 @@ class WorkflowClient:
         size = None
         if isinstance(image, np.ndarray) and image.ndim >= 2:
             size = (int(image.shape[1]), int(image.shape[0]))
+        image_arg = image if not isinstance(image, Path) else str(image)
+        if self.settings.detect_only:
+            result = self._sdk().run_workflow(
+                workspace_name=self.settings.workspace,
+                workflow_id=self.settings.player_workflow_id,
+                images={"image": image_arg},
+                parameters={"confidence": 0.35},
+                use_cache=self.settings.use_cache,
+            )
+            return parse_player_result(result, image_size=size)
         result = self._sdk().run_workflow(
             workspace_name=self.settings.workspace,
             workflow_id=self.settings.workflow_id,
-            images={"image": image if not isinstance(image, Path) else str(image)},
+            images={"image": image_arg},
             use_cache=self.settings.use_cache,
         )
         return parse_workflow_result(result, image_size=size)

@@ -40,6 +40,32 @@ def _load_corpus(source: str = "auto", limit: int | None = None):
     return plays, directory, resolved
 
 
+def _restore_film_context(play, path: Path) -> None:
+    """Keep hand-entered matchup labels when a clip is reprocessed."""
+    if not path.exists():
+        return
+    old = json.loads(path.read_text(encoding="utf-8"))
+    for key in ("season", "week", "defense_team", "offense_team", "coverage", "coverage_source"):
+        value = old.get(key)
+        if value is not None:
+            setattr(play, key, value)
+    situation = old.get("situation") or {}
+    for key in (
+        "down",
+        "distance",
+        "yardline",
+        "quarter",
+        "seconds_remaining",
+        "score_margin",
+        "offense_personnel",
+    ):
+        if situation.get(key) is not None:
+            setattr(play.situation, key, situation[key])
+    for note in (old.get("quality") or {}).get("notes") or []:
+        if note and ("Sugar Bowl" in note or "ESPN" in note) and note not in play.quality.notes:
+            play.quality.notes.append(note)
+
+
 @app.command()
 def doctor() -> None:
     """Check the environment, especially the GPU situation."""
@@ -490,8 +516,12 @@ def film_process(
         help="Film backend: auto (Roboflow when ROBOFLOW_API_KEY is set), roboflow, or local",
     ),
 ) -> None:
-    """Turn film into per-play tracking JSON via the Roboflow coverage workflow."""
-    from gridiron.coverage.bridge import upsert_predictions
+    """Turn film into tracking JSON, then score coverage from those points."""
+    from gridiron.coverage.bridge import (
+        load_default_models,
+        overlay_predictions_from_tracks,
+        upsert_predictions,
+    )
     from gridiron.tracking.schema import save_plays
     from gridiron.vision.pipeline import FilmPipeline, PipelineConfig
 
@@ -518,10 +548,25 @@ def film_process(
         raise typer.Exit(1)
 
     out_dir = cfg.plays_dir("film")
+    for play in plays:
+        _restore_film_context(play, out_dir / f"{play.play_id}.json")
     n = save_plays(plays, out_dir)
-    if pipeline.predictions:
-        pred_path = upsert_predictions(pipeline.predictions, cfg.predictions_path())
-        console.print(f"wrote {len(pipeline.predictions)} workflow coverage call(s) to {pred_path}")
+    post_model, pre_model = load_default_models()
+    if post_model is None and pre_model is None:
+        console.print(
+            "[yellow]no BDB coverage model on disk. Run `gridiron train baseline` "
+            "then re-process, or `gridiron score --source film`.[/yellow]"
+        )
+    else:
+        predictions = overlay_predictions_from_tracks(plays, post_model, pre_model)
+        if predictions:
+            pred_path = upsert_predictions(predictions, cfg.predictions_path())
+            console.print(f"wrote {len(predictions)} BDB coverage call(s) to {pred_path}")
+            for row in predictions:
+                console.print(
+                    f"  {row['play_id']}: {row['coverage']} "
+                    f"({float(row.get('confidence') or 0):.0%}) [{row.get('source')}]"
+                )
     for play in plays:
         rushers = sum(1 for p in play.players if p.role == "blitz")
         console.print(
@@ -1109,12 +1154,12 @@ def _load_scorer(model_path: Optional[Path]):
     from gridiron.coverage.train import TrainedCoverageNet
 
     if model_path is None:
-        net = cfg.models_dir() / "coverage_net.pt"
         baseline = cfg.models_dir() / "baseline_postsnap.joblib"
-        if net.exists():
-            model_path = net
-        elif baseline.exists():
+        net = cfg.models_dir() / "coverage_net.pt"
+        if baseline.exists():
             model_path = baseline
+        elif net.exists():
+            model_path = net
         else:
             console.print("[red]no trained model on disk; run `gridiron demo` or `gridiron train`[/red]")
             raise typer.Exit(1)

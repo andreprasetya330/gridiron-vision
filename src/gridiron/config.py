@@ -134,6 +134,15 @@ class RoboflowSettings:
         self.workflow_id = os.environ.get(
             "ROBOFLOW_WORKFLOW_ID", "defensive-coverage-analysis-1789781275490"
         ).strip()
+        self.player_workflow_id = os.environ.get(
+            "ROBOFLOW_PLAYER_WORKFLOW_ID", "american-football-player-trackin"
+        ).strip()
+        self.detect_only = os.environ.get("ROBOFLOW_DETECT_ONLY", "1").strip() not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
         self.use_cache = os.environ.get("ROBOFLOW_USE_CACHE", "1").strip() not in {
             "0",
             "false",
@@ -143,7 +152,8 @@ class RoboflowSettings:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key and self.workspace and self.workflow_id)
+        workflow = self.player_workflow_id if self.detect_only else self.workflow_id
+        return bool(self.api_key and self.workspace and workflow)
 
 
 class LLMSettings:

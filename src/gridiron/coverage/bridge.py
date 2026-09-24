@@ -234,6 +234,82 @@ def score_plays(plays: list[PlayTracks], model: Any) -> list[dict]:
     return out
 
 
+def is_still_play(play: PlayTracks) -> bool:
+    return any("still frame" in note for note in play.quality.notes)
+
+
+def load_default_models() -> tuple[Any | None, Any | None]:
+    """Return `(postsnap, presnap)` coverage models from disk, if trained."""
+    from gridiron.config import models_dir
+    from gridiron.coverage.baseline import CoverageBaseline
+
+    post = None
+    pre = None
+    root = models_dir()
+    baseline = root / "baseline_postsnap.joblib"
+    net = root / "coverage_net.pt"
+    if baseline.exists():
+        post = CoverageBaseline.load(baseline)
+    elif net.exists():
+        from gridiron.coverage.train import TrainedCoverageNet
+
+        post = TrainedCoverageNet.load(net)
+    presnap = root / "baseline_presnap.joblib"
+    if presnap.exists():
+        pre = CoverageBaseline.load(presnap)
+    return post, pre
+
+
+def overlay_predictions_from_tracks(
+    plays: list[PlayTracks],
+    post_model: Any | None,
+    pre_model: Any | None = None,
+) -> list[dict]:
+    """Score Roboflow-derived tracks with the BDB coverage model.
+
+    A still has no post-snap motion, so the displayed call is the pre-snap look.
+    Video clips use the post-snap model as what they ran, with the pre-snap model
+    as the look.
+    """
+    from gridiron.coverage.disguise import annotate_predictions
+
+    if not plays:
+        return []
+    still_ids = {p.play_id for p in plays if is_still_play(p)}
+    video_plays = [p for p in plays if p.play_id not in still_ids]
+    still_plays = [p for p in plays if p.play_id in still_ids]
+    by_id: dict[str, dict] = {}
+
+    if video_plays and post_model is not None:
+        post = score_plays(video_plays, post_model)
+        pre = score_plays(video_plays, pre_model) if pre_model is not None else None
+        for row in annotate_predictions(video_plays, post, pre):
+            row["source"] = "bdb-tracks"
+            by_id[row["play_id"]] = row
+    elif video_plays and pre_model is not None:
+        pre = score_plays(video_plays, pre_model)
+        for row in annotate_predictions(video_plays, pre, pre):
+            row["source"] = "bdb-presnap"
+            by_id[row["play_id"]] = row
+
+    if still_plays:
+        model = pre_model or post_model
+        if model is not None:
+            scored = score_plays(still_plays, model)
+            pre = scored if pre_model is not None else None
+            for row in annotate_predictions(still_plays, scored, pre):
+                row["source"] = "bdb-presnap" if pre_model is not None else "bdb-tracks"
+                notes = list(row.get("notes") or [])
+                notes.append(
+                    "Still frame: coverage is the pre-snap look from minimap points. "
+                    "What they ran after the snap needs video."
+                )
+                row["notes"] = notes
+                by_id[row["play_id"]] = row
+
+    return [by_id[p.play_id] for p in plays if p.play_id in by_id]
+
+
 def write_predictions(predictions: list[dict], path: Path) -> Path:
     import json
 

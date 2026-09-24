@@ -160,8 +160,8 @@ def test_pipeline_still_uses_workflow_stub(tmp_path: Path, monkeypatch):
     assert play.source == "film"
     assert play.quality.defenders_detected >= 9
     assert play.quality.offense_detected >= 9
-    assert pipeline.predictions[0]["coverage"] == "Cover 0 Man"
-    assert "experimental" in "".join(play.quality.notes).lower() or play.quality.notes
+    assert pipeline.predictions == []
+    assert any("still frame" in n for n in play.quality.notes)
 
 
 def test_parse_workflow_result_reads_listed_outputs():
@@ -200,3 +200,121 @@ def test_parse_workflow_result_reads_listed_outputs():
     assert parsed.coverage.coverage == "Cover 0 Man"
     assert parsed.players[0].field_x == pytest.approx(20.0)
     assert parsed.image_width == 1920
+
+
+def test_field_players_from_detections_maps_calibration_corner():
+    cv2 = pytest.importorskip("cv2")
+    from gridiron.vision.roboflow import field_players_from_detections
+
+    # Center such that the box foot (x, y2) lands on the first UGA polygon point.
+    detections = [
+        {
+            "x": 775.0,
+            "y": 48.0,
+            "width": 20.0,
+            "height": 20.0,
+            "class": "offense_player",
+            "confidence": 0.9,
+        },
+        {
+            "x": 100.0,
+            "y": 100.0,
+            "width": 20.0,
+            "height": 20.0,
+            "class": "official",
+            "confidence": 0.9,
+        },
+    ]
+    players = field_players_from_detections(detections, 1920, 1080)
+    assert len(players) == 1
+    assert players[0].side == "offense"
+    assert players[0].field_x == pytest.approx(10.0, abs=0.4)
+    assert players[0].field_y == pytest.approx(0.0, abs=0.4)
+
+
+def test_overlay_uses_presnap_model_on_still_frame():
+    from gridiron.coverage.bridge import overlay_predictions_from_tracks
+    from gridiron.tracking.schema import N_FRAMES, PlayerTrack, PlayTracks, TrackQuality
+
+    play = PlayTracks(
+        play_id="still-1",
+        source="film",
+        players=[
+            PlayerTrack(
+                track_id="D_1",
+                side="defense",
+                x=np.zeros(N_FRAMES, dtype=np.float32),
+                y=np.zeros(N_FRAMES, dtype=np.float32),
+            )
+        ],
+        quality=TrackQuality(notes=["still frame: formation is held at the snap, so velocities are zero"]),
+    )
+
+    class FakeModel:
+        def __init__(self, coverage: str) -> None:
+            self.coverage = coverage
+
+        def predict_play(self, scored):
+            return {
+                "play_id": scored.play_id,
+                "coverage": self.coverage,
+                "confidence": 0.61,
+                "probabilities": {c: (0.61 if c == self.coverage else 0.02) for c in COVERAGES},
+                "runner_up": "Cover 1 Man",
+                "roles": {},
+                "quality_score": 0.4,
+                "usable": False,
+            }
+
+    rows = overlay_predictions_from_tracks(
+        [play],
+        post_model=FakeModel("Cover 3 Zone"),
+        pre_model=FakeModel("Cover 1 Man"),
+    )
+    assert len(rows) == 1
+    assert rows[0]["coverage"] == "Cover 1 Man"
+    assert rows[0]["source"] == "bdb-presnap"
+    assert any("Still frame" in n for n in rows[0]["notes"])
+
+
+def test_overlay_uses_postsnap_model_on_video_tracks():
+    from gridiron.coverage.bridge import overlay_predictions_from_tracks
+    from gridiron.tracking.schema import N_FRAMES, PlayerTrack, PlayTracks
+
+    play = PlayTracks(
+        play_id="clip-1",
+        source="film",
+        players=[
+            PlayerTrack(
+                track_id="D_1",
+                side="defense",
+                x=np.linspace(4.0, 12.0, N_FRAMES, dtype=np.float32),
+                y=np.zeros(N_FRAMES, dtype=np.float32),
+            )
+        ],
+    )
+
+    class FakeModel:
+        def __init__(self, coverage: str) -> None:
+            self.coverage = coverage
+
+        def predict_play(self, scored):
+            return {
+                "play_id": scored.play_id,
+                "coverage": self.coverage,
+                "confidence": 0.8,
+                "probabilities": {c: (0.8 if c == self.coverage else 0.02) for c in COVERAGES},
+                "runner_up": "Cover 1 Man",
+                "roles": {},
+                "quality_score": 0.7,
+                "usable": True,
+            }
+
+    rows = overlay_predictions_from_tracks(
+        [play],
+        post_model=FakeModel("Cover 3 Zone"),
+        pre_model=FakeModel("Cover 2 Zone"),
+    )
+    assert rows[0]["coverage"] == "Cover 3 Zone"
+    assert rows[0]["source"] == "bdb-tracks"
+    assert rows[0]["presnap"]["coverage"] == "Cover 2 Zone"
