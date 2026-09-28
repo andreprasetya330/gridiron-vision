@@ -59,6 +59,17 @@ def api_env(tmp_path, monkeypatch):
                     "roles": {},
                     "quality_score": 0.9,
                     "usable": True,
+                    "presnap": {"coverage": "Cover 2 Zone", "confidence": 0.62, "probabilities": {}},
+                    "disguise": {
+                        "showed": "Cover 2 Zone",
+                        "ran": "Cover 3 Zone",
+                        "showed_shell": "2-high",
+                        "ran_shell": "1-high",
+                        "kind": "shell",
+                        "disguised": True,
+                        "family_mismatch": False,
+                        "shell_mismatch": True,
+                    },
                 }
             ]
         ),
@@ -95,6 +106,10 @@ def test_list_plays_joins_predictions(api_env):
     assert play["defense_team"] == "Washington"
     assert play["coverage_predicted"] == "Cover 3 Zone"
     assert play["coverage_truth"] == "Cover 3 Zone"
+    assert play["disguised"] is True
+    assert play["coverage_presnap"] == "Cover 2 Zone"
+    assert play["coverage_family"] == "Zone"
+    assert play["coverage_shell"] == "3+-high"
 
 
 def test_get_play_includes_tracks_and_prediction(api_env):
@@ -103,6 +118,9 @@ def test_get_play_includes_tracks_and_prediction(api_env):
     body = r.json()
     assert body["players"][0]["track_id"] == "D_1"
     assert body["prediction"]["coverage"] == "Cover 3 Zone"
+    assert body["prediction"]["disguise"]["disguised"] is True
+    assert body["coverage_family"] == "Zone"
+    assert body["media_kind"] is None
     assert "time_grid" in body
 
 
@@ -120,3 +138,95 @@ def test_reports_are_listed_and_served(api_env):
 def test_team_filter(api_env):
     assert api_env.get("/api/plays", params={"team": "Washington"}).json()["total"] == 1
     assert api_env.get("/api/plays", params={"team": "Oregon State"}).json()["total"] == 0
+
+
+def test_teams_respect_source(api_env):
+    body = api_env.get("/api/teams").json()
+    assert body["teams"][0]["team"] == "Washington"
+    film = api_env.get("/api/teams", params={"source": "film"}).json()
+    assert film["teams"] == []
+
+
+def test_disguise_filter(api_env):
+    assert api_env.get("/api/plays", params={"disguised_only": True}).json()["total"] == 1
+
+
+def test_ingest_files_play_under_team(api_env, monkeypatch):
+    from gridiron.taxonomy import COVERAGES
+    from gridiron.tracking.schema import N_FRAMES, PlayerTrack, PlayTracks
+    from gridiron.vision.ingest import FilmIngestResult
+    import numpy as np
+
+    def fake_ingest(request):
+        from gridiron.config import plays_dir
+        from gridiron.tracking.schema import save_play
+
+        play = PlayTracks(
+            play_id="georgia-clip",
+            source="film",
+            players=[
+                PlayerTrack(
+                    track_id="D_1",
+                    side="defense",
+                    x=np.zeros(N_FRAMES, dtype=np.float32),
+                    y=np.zeros(N_FRAMES, dtype=np.float32),
+                )
+            ],
+            defense_team=request.defense_team,
+            offense_team=request.offense_team,
+            video_path=str(request.path),
+            vision_model="andre-4cotb/american-football-player-trackin-1-rfdetr-small-t1",
+            vision_frames=[
+                {
+                    "boxes": [
+                        {
+                            "class_name": "defense_player",
+                            "side": "defense",
+                            "confidence": 0.9,
+                            "box": [10.0, 20.0, 40.0, 80.0],
+                        }
+                    ],
+                    "players": [
+                        {
+                            "track_id": "D_1",
+                            "side": "defense",
+                            "class_name": "defense_player",
+                            "minimap_x": 560.0,
+                            "minimap_y": 200.0,
+                        }
+                    ],
+                }
+            ],
+            minimap_width=1200,
+            minimap_height=533,
+        )
+        save_play(play, plays_dir("film") / f"{play.play_id}.json")
+        prediction = {
+            "play_id": play.play_id,
+            "coverage": "Cover 2 Zone",
+            "confidence": 0.84,
+            "probabilities": {c: (0.84 if c == "Cover 2 Zone" else 0.02) for c in COVERAGES},
+            "runner_up": "Cover 4 Zone",
+            "roles": {},
+            "quality_score": 0.7,
+            "usable": True,
+        }
+        return FilmIngestResult(plays=[play], predictions=[prediction])
+
+    monkeypatch.setattr("gridiron.api.main.ingest_film", fake_ingest)
+    response = api_env.post(
+        "/api/film/ingest",
+        files={"file": ("uga.jpg", b"fake-bytes", "image/jpeg")},
+        data={"defense_team": "Georgia", "offense_team": "Notre Dame"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    play = body["plays"][0]
+    assert play["defense_team"] == "Georgia"
+    assert play["coverage_family"] == "Zone"
+    assert play["prediction"]["coverage"] == "Cover 2 Zone"
+    assert play["media_kind"] == "image"
+    assert play["vision_frames"][0]["boxes"][0]["box"] == [10.0, 20.0, 40.0, 80.0]
+    assert play["vision_frames"][0]["players"][0]["minimap_x"] == 560.0
+    listed = api_env.get("/api/plays", params={"source": "film", "team": "Georgia"}).json()
+    assert listed["total"] == 1

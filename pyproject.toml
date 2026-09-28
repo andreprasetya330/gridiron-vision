@@ -28,6 +28,7 @@ dependencies = [
     "rich>=13.7",
     "tqdm>=4.66",
     "python-dotenv>=1.0",
+    "python-multipart>=0.0.9",
     "kagglehub>=0.3",
     "rdata>=0.11",
 ]

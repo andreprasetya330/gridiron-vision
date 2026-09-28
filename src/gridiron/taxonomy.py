@@ -50,6 +50,25 @@ def is_man(coverage: str) -> bool:
     return coverage in MAN_COVERAGES
 
 
+def family_of(coverage: str | None) -> str | None:
+    """Coarse bucket used to file a play under a team: Man, Zone, or Prevent."""
+    if not coverage:
+        return None
+    if coverage == "Prevent":
+        return "Prevent"
+    if coverage in MAN_COVERAGES:
+        return "Man"
+    if coverage in ZONE_COVERAGES or coverage in COVERAGES:
+        return "Zone"
+    return None
+
+
+def coverage_shell(coverage: str | None) -> str | None:
+    if not coverage or coverage not in DEEP_DEFENDERS:
+        return None
+    return shell_of(coverage)
+
+
 DEFENDER_ROLES: list[str] = ["man", "underneath_zone", "deep_zone", "blitz"]
 ROLE_INDEX: dict[str, int] = {name: i for i, name in enumerate(DEFENDER_ROLES)}
 

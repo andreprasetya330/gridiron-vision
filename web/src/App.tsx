@@ -1,69 +1,135 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { CoveragePanel } from "./components/CoveragePanel";
 import { FieldView } from "./components/FieldView";
+import { FilmIngest } from "./components/FilmIngest";
+import { PlayerMinimap } from "./components/PlayerMinimap";
 import { VideoOverlay } from "./components/VideoOverlay";
 import type { Health, Play, PlaySummary } from "./types";
 
 const SNAP_LABEL = "SNAP";
 
+interface LibraryGroup {
+  team: string;
+  families: { family: string; plays: PlaySummary[] }[];
+}
+
+function groupByTeamAndFamily(plays: PlaySummary[]): LibraryGroup[] {
+  const teams = new Map<string, Map<string, PlaySummary[]>>();
+  for (const play of plays) {
+    const team = play.defense_team || "Unassigned";
+    const family = play.coverage_family || "Unscored";
+    if (!teams.has(team)) teams.set(team, new Map());
+    const families = teams.get(team)!;
+    if (!families.has(family)) families.set(family, []);
+    families.get(family)!.push(play);
+  }
+  return [...teams.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([team, families]) => ({
+      team,
+      families: [...families.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([family, grouped]) => ({ family, plays: grouped })),
+    }));
+}
+
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [teams, setTeams] = useState<{ team: string; plays: number }[]>([]);
+  const [source, setSource] = useState<string>("film");
   const [team, setTeam] = useState<string>("");
+  const [filtersReady, setFiltersReady] = useState(false);
   const [coverageFilter, setCoverageFilter] = useState<string>("");
+  const [disguiseOnly, setDisguiseOnly] = useState(false);
   const [plays, setPlays] = useState<PlaySummary[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [play, setPlay] = useState<Play | null>(null);
   const [frame, setFrame] = useState(20);
   const [playing, setPlaying] = useState(false);
-  const [showRoles, setShowRoles] = useState(true);
   const [showTrails, setShowTrails] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [libraryTick, setLibraryTick] = useState(0);
 
   const rafRef = useRef<number | null>(null);
   const lastTickRef = useRef<number>(0);
 
-  useEffect(() => {
+  const refreshCatalog = useCallback(() => {
     api
       .health()
       .then(setHealth)
       .catch((e) => setError(String(e)));
     api
-      .teams()
+      .teams(source)
       .then((r) => {
         setTeams(r.teams);
-        if (r.teams.length > 0) setTeam(r.teams[0].team);
+        setTeam((current) => {
+          if (current && r.teams.some((t) => t.team === current)) return current;
+          return "";
+        });
+        setFiltersReady(true);
       })
-      .catch(() => undefined);
-  }, []);
+      .catch(() => setFiltersReady(true));
+  }, [source]);
 
   useEffect(() => {
+    refreshCatalog();
+  }, [refreshCatalog, libraryTick]);
+
+  useEffect(() => {
+    if (!filtersReady) return;
+    const controller = new AbortController();
     api
-      .plays({ team: team || undefined, coverage: coverageFilter || undefined, limit: 400 })
+      .plays(
+        {
+          team: team || undefined,
+          coverage: coverageFilter || undefined,
+          disguised_only: disguiseOnly || undefined,
+          source,
+          limit: 400,
+        },
+        controller.signal,
+      )
       .then((r) => {
         setPlays(r.plays);
-        if (r.plays.length > 0) setSelected(r.plays[0].play_id);
+        setSelected((current) => {
+          if (current && r.plays.some((item) => item.play_id === current)) return current;
+          return r.plays[0]?.play_id ?? null;
+        });
       })
-      .catch((e) => setError(String(e)));
-  }, [team, coverageFilter]);
+      .catch((e) => {
+        if (e instanceof Error && e.name === "AbortError") return;
+        setError(String(e));
+      });
+    return () => controller.abort();
+  }, [filtersReady, team, coverageFilter, disguiseOnly, source, libraryTick]);
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selected) {
+      setPlay(null);
+      return;
+    }
+    const controller = new AbortController();
     api
-      .play(selected)
+      .play(selected, controller.signal)
       .then((p) => {
         setPlay(p);
         setFrame(p.time_grid.findIndex((t) => Math.abs(t) < 1e-6) || 20);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (e instanceof Error && e.name === "AbortError") return;
+        setError(String(e));
+      });
+    return () => controller.abort();
   }, [selected]);
 
   const nFrames = play?.time_grid.length ?? 51;
+  const disguiseCount = useMemo(() => plays.filter((p) => p.disguised).length, [plays]);
+  const library = useMemo(() => groupByTeamAndFamily(plays), [plays]);
 
   const tick = useCallback(
     (timestamp: number) => {
-      if (timestamp - lastTickRef.current >= 60) {
+      if (timestamp - lastTickRef.current >= 100) {
         lastTickRef.current = timestamp;
         setFrame((f) => (f + 1 >= nFrames ? 0 : f + 1));
       }
@@ -97,162 +163,262 @@ export default function App() {
   }, [nFrames]);
 
   const currentTime = play?.time_grid[frame] ?? 0;
+  const visionFrame = play?.vision_frames?.[frame] ?? play?.vision_frames?.[0];
+  const hasVision = Boolean(
+    visionFrame && ((visionFrame.boxes?.length ?? 0) > 0 || (visionFrame.players?.length ?? 0) > 0),
+  );
+  const matchup = play
+    ? `${play.defense_team ?? "Defense"} vs ${play.offense_team ?? "offense"}`
+    : "Drop film to analyze a play";
 
   return (
-    <div className="app">
-      <header>
-        <div className="brand">
-          <span className="logo">GV</span>
-          <div>
-            <h1>Gridiron Vision</h1>
-            <p>Coverage detection and tell mining for football film</p>
-          </div>
-        </div>
-        <div className="header-stats">
-          {health && (
-            <>
-              <span>{health.plays} plays</span>
-              <span>{health.predictions} scored</span>
-            </>
-          )}
-        </div>
-      </header>
+    <div className="page">
+      <div className="shell">
+        <nav className="rail" aria-label="Workspace">
+          <span className="rail-logo">GV</span>
+          <span className="rail-dot active" title="Film room" />
+        </nav>
 
-      {error && <div className="error">{error}</div>}
-
-      <div className="layout">
-        <aside className="sidebar">
-          <label className="field-label">
-            Defense
-            <select value={team} onChange={(e) => setTeam(e.target.value)}>
-              <option value="">All teams</option>
-              {teams.map((t) => (
-                <option key={t.team} value={t.team}>
-                  {t.team} ({t.plays})
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="field-label">
-            Coverage
-            <select value={coverageFilter} onChange={(e) => setCoverageFilter(e.target.value)}>
-              <option value="">All coverages</option>
-              {(health?.coverages ?? []).map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="play-list">
-            {plays.map((summary) => {
-              const correct =
-                summary.coverage_truth && summary.coverage_predicted
-                  ? summary.coverage_truth === summary.coverage_predicted
-                  : null;
-              return (
-                <button
-                  key={summary.play_id}
-                  className={`play-item ${selected === summary.play_id ? "active" : ""}`}
-                  onClick={() => setSelected(summary.play_id)}
-                >
-                  <div className="play-item-top">
-                    <span className="play-week">W{summary.week ?? "?"}</span>
-                    <span className="play-cov">{summary.coverage_predicted ?? "—"}</span>
-                    {correct !== null && (
-                      <span className={`dot ${correct ? "ok" : "bad"}`} title={correct ? "matches label" : "differs from label"} />
-                    )}
-                  </div>
-                  <div className="play-item-sub">
-                    {summary.situation?.down ? `${summary.situation.down} & ` : ""}
-                    {summary.situation?.distance ?? ""}
-                    {!summary.usable && <span className="flag">low quality</span>}
-                  </div>
-                </button>
-              );
-            })}
-            {plays.length === 0 && (
-              <p className="muted">
-                No plays yet. Run <code>uv run gridiron demo</code> to generate a season.
+        <div className="workspace">
+          <header>
+            <div>
+              <p className="eyebrow">Coverage control center</p>
+              <h1>Gridiron Vision</h1>
+              <p className="lede">
+                Put film in. Get the player-tracking boxes and a minimap of those detections.
               </p>
-            )}
-          </div>
-        </aside>
-
-        <main className="stage">
-          {play ? (
-            <>
-              <div className="stage-header">
-                <div>
-                  <h2>{play.play_id}</h2>
-                  <p className="muted">
-                    {play.defense_team ?? "defense"} vs {play.offense_team ?? "offense"}
-                    {play.situation.down
-                      ? ` · ${play.situation.down} and ${play.situation.distance}`
-                      : ""}
-                    {play.situation.hash_side ? ` · ${play.situation.hash_side} hash` : ""}
-                    {play.situation.offense_personnel
-                      ? ` · ${play.situation.offense_personnel} personnel`
-                      : ""}
-                  </p>
-                </div>
-                <div className="toggles">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={showRoles}
-                      onChange={(e) => setShowRoles(e.target.checked)}
-                    />
-                    Roles
-                  </label>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={showTrails}
-                      onChange={(e) => setShowTrails(e.target.checked)}
-                    />
-                    Trails
-                  </label>
-                </div>
+            </div>
+            <div className="header-stats">
+              <div className="stat-chip">
+                <span>Film plays</span>
+                <strong>{health?.sources?.film ?? plays.length}</strong>
               </div>
+              <div className="stat-chip">
+                <span>Scored</span>
+                <strong>{health?.predictions ?? "—"}</strong>
+              </div>
+              <div className="stat-chip">
+                <span>Disguise in view</span>
+                <strong>{disguiseCount}</strong>
+              </div>
+            </div>
+          </header>
 
-              <VideoOverlay play={play} frame={frame} showRoles={showRoles} />
-              <FieldView play={play} frame={frame} showRoles={showRoles} showTrails={showTrails} />
+          <FilmIngest
+            knownTeams={teams.map((item) => item.team)}
+            onError={setError}
+            onAnalyzed={(next, defenseTeam) => {
+              setSource("film");
+              setTeam(defenseTeam);
+              setPlay(next);
+              setSelected(next.play_id);
+              setFrame(next.time_grid.findIndex((t) => Math.abs(t) < 1e-6) || 20);
+              setLibraryTick((value) => value + 1);
+            }}
+          />
 
-              <div className="scrubber">
-                <button className="play-button" onClick={() => setPlaying((p) => !p)}>
-                  {playing ? "Pause" : "Play"}
-                </button>
+          {error && <div className="error">{error}</div>}
+
+          <div className="layout">
+            <aside className="sidebar card">
+              <p className="eyebrow">Library</p>
+              <label className="field-label">
+                Corpus
+                <select
+                  value={source}
+                  onChange={(e) => {
+                    setFiltersReady(false);
+                    setPlays([]);
+                    setTeams([]);
+                    setPlay(null);
+                    setSelected(null);
+                    setTeam("");
+                    setSource(e.target.value);
+                  }}
+                >
+                  <option value="film">Film</option>
+                  <option value="auto">Tracking (BDB)</option>
+                </select>
+              </label>
+
+              <label className="field-label">
+                Defense
+                <select value={team} onChange={(e) => setTeam(e.target.value)}>
+                  <option value="">All teams</option>
+                  {teams.map((t) => (
+                    <option key={t.team} value={t.team}>
+                      {t.team} ({t.plays})
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field-label">
+                Coverage
+                <select value={coverageFilter} onChange={(e) => setCoverageFilter(e.target.value)}>
+                  <option value="">All coverages</option>
+                  {(health?.coverages ?? []).map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="check-label">
                 <input
-                  type="range"
-                  min={0}
-                  max={nFrames - 1}
-                  value={frame}
-                  onChange={(e) => setFrame(Number(e.target.value))}
+                  type="checkbox"
+                  checked={disguiseOnly}
+                  onChange={(e) => setDisguiseOnly(e.target.checked)}
                 />
-                <span className="timecode">
-                  {Math.abs(currentTime) < 1e-6
-                    ? SNAP_LABEL
-                    : `${currentTime > 0 ? "+" : ""}${currentTime.toFixed(2)}s`}
-                </span>
-              </div>
+                Disguise only
+              </label>
 
-              <div className="legend">
-                <span className="key man">Man</span>
-                <span className="key deep">Deep zone</span>
-                <span className="key under">Underneath zone</span>
-                <span className="key blitz">Blitz</span>
-                <span className="key off">Offense</span>
+              <div className="play-list">
+                {filtersReady &&
+                  library.map((group) => (
+                    <div className="library-team" key={group.team}>
+                      <h3 className="library-team-name">{group.team}</h3>
+                      {group.families.map((family) => (
+                        <div key={`${group.team}-${family.family}`}>
+                          <p className="library-family">{family.family}</p>
+                          {family.plays.map((summary) => {
+                            const correct =
+                              summary.coverage_truth && summary.coverage_predicted
+                                ? summary.coverage_truth === summary.coverage_predicted
+                                : null;
+                            return (
+                              <button
+                                key={summary.play_id}
+                                className={`play-item ${selected === summary.play_id ? "active" : ""}`}
+                                onClick={() => setSelected(summary.play_id)}
+                              >
+                                <div className="play-item-top">
+                                  <span className="play-cov">
+                                    {summary.coverage_predicted ?? "—"}
+                                  </span>
+                                  {correct !== null && (
+                                    <span
+                                      className={`dot ${correct ? "ok" : "bad"}`}
+                                      title={correct ? "matches label" : "differs from label"}
+                                    />
+                                  )}
+                                </div>
+                                <div className="play-item-sub">
+                                  {summary.coverage_shell ?? ""}
+                                  {summary.situation?.down ? ` · ${summary.situation.down} & ` : ""}
+                                  {summary.situation?.distance ?? ""}
+                                  {summary.has_video && <span className="flag film">film</span>}
+                                  {summary.disguised && (
+                                    <span className="flag disguise">disguise</span>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                {!filtersReady && <p className="muted">Loading plays…</p>}
+                {filtersReady && plays.length === 0 && (
+                  <p className="muted">
+                    {source === "film"
+                      ? "No film plays yet. Drop a clip above."
+                      : "No plays in this filter."}
+                  </p>
+                )}
               </div>
-            </>
-          ) : (
-            <p className="muted">Select a play.</p>
-          )}
-        </main>
+            </aside>
 
-        <aside className="details">{play && <CoveragePanel play={play} />}</aside>
+            <main className="stage">
+              {play ? (
+                <>
+                  <div className="stage-header">
+                    <div>
+                      <h2>{matchup}</h2>
+                      <p className="muted">
+                        {[play.coverage_family, play.prediction?.coverage ?? play.coverage]
+                          .filter(Boolean)
+                          .join(" · ") || play.play_id}
+                        {play.situation.down
+                          ? ` · ${play.situation.down} and ${play.situation.distance}`
+                          : ""}
+                      </p>
+                    </div>
+                    <label className="check-label inline">
+                      <input
+                        type="checkbox"
+                        checked={showTrails}
+                        onChange={(e) => setShowTrails(e.target.checked)}
+                      />
+                      Trails
+                    </label>
+                  </div>
+
+                  <div className="stage-body">
+                    <div className="stage-visuals">
+                      {play.video_path && <VideoOverlay play={play} frame={frame} />}
+                      <div className="minimap-row">
+                        {hasVision ? (
+                          <div className="minimap-pane">
+                            <p className="minimap-label">
+                              Player layout
+                              {visionFrame?.players?.length
+                                ? ` · ${visionFrame.players.length} detections`
+                                : ""}
+                            </p>
+                            <PlayerMinimap play={play} frame={frame} />
+                          </div>
+                        ) : (
+                          <div className="minimap-pane">
+                            <p className="minimap-label">Minimap</p>
+                            <FieldView play={play} frame={frame} showTrails={showTrails} />
+                          </div>
+                        )}
+                        {play.minimap_url && !hasVision && (
+                          <div className="minimap-pane">
+                            <p className="minimap-label">Bird&apos;s-eye snapshot</p>
+                            <img
+                              className="minimap-still"
+                              src={play.minimap_url}
+                              alt="Projected player minimap"
+                            />
+                          </div>
+                        )}
+                      </div>
+                      {!play.video_path && (
+                        <p className="muted film-hint">No film clip on this play.</p>
+                      )}
+                      <div className="scrubber card">
+                        <button className="play-button" onClick={() => setPlaying((p) => !p)}>
+                          {playing ? "Pause" : "Play"}
+                        </button>
+                        <input
+                          type="range"
+                          min={0}
+                          max={nFrames - 1}
+                          value={frame}
+                          onChange={(e) => setFrame(Number(e.target.value))}
+                        />
+                        <span className="timecode">
+                          {Math.abs(currentTime) < 1e-6
+                            ? SNAP_LABEL
+                            : `${currentTime > 0 ? "+" : ""}${currentTime.toFixed(2)}s`}
+                        </span>
+                      </div>
+                    </div>
+                    <aside className="details">
+                      <CoveragePanel play={play} />
+                    </aside>
+                  </div>
+                </>
+              ) : (
+                <p className="muted">Drop a clip to see player tracking and the field minimap.</p>
+              )}
+            </main>
+          </div>
+        </div>
       </div>
     </div>
   );

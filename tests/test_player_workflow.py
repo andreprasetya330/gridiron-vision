@@ -84,6 +84,17 @@ def test_parse_player_result_reads_live_output_keys():
     assert any(p.side == "offense" for p in parsed.players)
     assert any(p.side == "defense" for p in parsed.players)
     assert all(p.class_name != "official" for p in parsed.players)
+    assert parsed.detections
+    assert parsed.model_id and "rfdetr" in parsed.model_id
+    from gridiron.vision.roboflow import overlay_boxes_from_detections
+
+    boxes = overlay_boxes_from_detections(parsed.detections)
+    assert {row["class_name"] for row in boxes} == {
+        "offense_player",
+        "defense_player",
+        "official",
+    }
+    assert all(row["box"] and len(row["box"]) == 4 for row in boxes)
 
 
 @pytest.mark.skipif(not SAMPLE_IMAGE.exists(), reason="uga-play.jpg is local-only")

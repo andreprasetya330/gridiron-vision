@@ -69,6 +69,35 @@ def test_play_json_round_trips_overlay_fields(tmp_path: Path):
     assert loaded.homography == play.homography
     assert loaded.origin_x == pytest.approx(55.0)
     assert loaded.video_width == 1280
+    play.vision_model = "andre-4cotb/american-football-player-trackin-1-rfdetr-small-t1"
+    play.vision_frames = [
+        {
+            "boxes": [
+                {
+                    "class_name": "defense_player",
+                    "side": "defense",
+                    "confidence": 0.9,
+                    "box": [10.0, 20.0, 40.0, 80.0],
+                }
+            ],
+            "players": [
+                {
+                    "track_id": "D_1",
+                    "side": "defense",
+                    "class_name": "defense_player",
+                    "minimap_x": 560.0,
+                    "minimap_y": 200.0,
+                }
+            ],
+        }
+    ]
+    play.minimap_width = 1200
+    play.minimap_height = 533
+    save_play(play, path)
+    loaded = load_play(path)
+    assert loaded.vision_model == play.vision_model
+    assert loaded.vision_frames == play.vision_frames
+    assert loaded.minimap_width == 1200
     # Old payloads without these fields must still load.
     raw = path.read_text(encoding="utf-8")
     stripped = PlayTracks.from_dict(

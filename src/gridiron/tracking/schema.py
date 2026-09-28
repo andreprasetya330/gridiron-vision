@@ -224,6 +224,12 @@ class PlayTracks:
     play_direction: str = "right"
     video_width: int | None = None
     video_height: int | None = None
+    # Roboflow player-workflow overlay: image-space boxes plus the projected
+    # minimap layout, aligned to `time_grid`. Absent on BDB / synthetic plays.
+    vision_model: str | None = None
+    vision_frames: list[dict[str, Any]] | None = None
+    minimap_width: int | None = None
+    minimap_height: int | None = None
     # Coverage scoring always reads the first N_FRAMES (the locked ± window).
     # Film plays may extend `time_grid` past +3s so the overlay can follow the
     # rest of the clip instead of cutting it off.
@@ -298,6 +304,10 @@ class PlayTracks:
             "play_direction": self.play_direction,
             "video_width": self.video_width,
             "video_height": self.video_height,
+            "vision_model": self.vision_model,
+            "vision_frames": self.vision_frames,
+            "minimap_width": self.minimap_width,
+            "minimap_height": self.minimap_height,
             "situation": asdict(self.situation),
             "quality": {
                 **asdict(self.quality),
@@ -368,6 +378,10 @@ class PlayTracks:
             play_direction=payload.get("play_direction", "right"),
             video_width=payload.get("video_width"),
             video_height=payload.get("video_height"),
+            vision_model=payload.get("vision_model"),
+            vision_frames=payload.get("vision_frames"),
+            minimap_width=payload.get("minimap_width"),
+            minimap_height=payload.get("minimap_height"),
             time_grid=np.array(payload.get("time_grid", TIME_GRID.tolist()), dtype=np.float64),
         )
 

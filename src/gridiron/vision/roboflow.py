@@ -159,6 +159,8 @@ class WorkflowFrame:
     output_png: bytes | None = None
     notes: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    detections: list[dict[str, Any]] = field(default_factory=list)
+    model_id: str | None = None
 
 
 def map_coverage_label(raw: str | None) -> str | None:
@@ -252,6 +254,32 @@ def compact_detections(payload: Any) -> list[dict[str, Any]]:
         if item:
             compact.append(item)
     return compact
+
+
+def _side_from_class(class_name: str) -> str | None:
+    name = class_name.lower()
+    if "offense" in name:
+        return "offense"
+    if "defense" in name:
+        return "defense"
+    return None
+
+
+def overlay_boxes_from_detections(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Image-space boxes for the film overlay. Includes every model class."""
+    rows: list[dict[str, Any]] = []
+    for det in detections:
+        class_name = str(det.get("class") or det.get("class_name") or "player")
+        box = _box_xyxy(det)
+        rows.append(
+            {
+                "class_name": class_name,
+                "side": _side_from_class(class_name),
+                "confidence": round(float(det.get("confidence") or 0.0), 4),
+                "box": [round(float(v), 1) for v in box] if box else None,
+            }
+        )
+    return rows
 
 
 def player_workflow_parameters(settings: RoboflowSettings | None = None) -> dict[str, Any]:
@@ -546,6 +574,8 @@ def parse_workflow_result(result: Any, image_size: tuple[int, int] | None = None
         output_png=_decode_image_bytes(payload.get("output_image")),
         notes=notes,
         raw={k: v for k, v in payload.items() if k not in {"minimap", "output_image"}},
+        detections=compact_detections(payload.get("player_predictions")),
+        model_id=str(payload.get("model_id") or "") or None,
     )
 
 
@@ -669,6 +699,8 @@ def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) 
         output_png=None,
         notes=notes,
         raw=raw,
+        detections=detections,
+        model_id=str(payload.get("model_id") or "") or None,
     )
 
 

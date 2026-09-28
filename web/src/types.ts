@@ -41,6 +41,26 @@ export interface RolePrediction {
   probabilities: Record<string, number>;
 }
 
+export interface Disguise {
+  showed: string | null;
+  ran: string;
+  showed_shell: string | null;
+  ran_shell: string | null;
+  kind: string;
+  disguised: boolean;
+  family_mismatch: boolean;
+  shell_mismatch: boolean;
+  showed_confidence: number | null;
+  ran_confidence: number | null;
+}
+
+export interface LookPrediction {
+  coverage: string;
+  confidence: number;
+  probabilities: Record<string, number>;
+  runner_up?: string;
+}
+
 export interface Prediction {
   play_id: string;
   coverage: string;
@@ -50,6 +70,8 @@ export interface Prediction {
   roles: Record<string, RolePrediction>;
   quality_score: number;
   usable: boolean;
+  presnap?: LookPrediction | null;
+  disguise?: Disguise | null;
 }
 
 export interface Play {
@@ -75,6 +97,34 @@ export interface Play {
   time_grid: number[];
   players: PlayerTrack[];
   prediction: Prediction | null;
+  coverage_family?: string | null;
+  coverage_shell?: string | null;
+  minimap_url?: string | null;
+  media_kind?: "video" | "image" | null;
+  vision_model?: string | null;
+  vision_frames?: VisionFrame[] | null;
+  minimap_width?: number | null;
+  minimap_height?: number | null;
+}
+
+export interface VisionDetection {
+  class_name: string;
+  side: Side | null;
+  confidence: number;
+  box: [number, number, number, number] | null;
+}
+
+export interface VisionPlayer {
+  track_id?: string | null;
+  side: Side | null;
+  class_name: string;
+  minimap_x: number;
+  minimap_y: number;
+}
+
+export interface VisionFrame {
+  boxes: VisionDetection[];
+  players: VisionPlayer[];
 }
 
 export interface PlaySummary {
@@ -85,10 +135,15 @@ export interface PlaySummary {
   offense_team: string | null;
   coverage_truth: string | null;
   coverage_predicted: string | null;
+  coverage_presnap?: string | null;
   confidence: number | null;
   usable: boolean;
   source: string;
   has_video: boolean;
+  disguised?: boolean;
+  disguise_kind?: string | null;
+  coverage_family?: string | null;
+  coverage_shell?: string | null;
   situation: Partial<Situation>;
 }
 
@@ -96,6 +151,8 @@ export interface Health {
   status: string;
   plays: number;
   predictions: number;
+  corpus?: string;
+  sources?: Record<string, number>;
   coverages: string[];
   roles: string[];
   time_grid: number[];

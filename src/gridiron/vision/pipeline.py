@@ -396,6 +396,9 @@ class FilmPipeline:
                     ],
                     "field_positions": field_positions,
                     "sides": sides,
+                    "assigned": assigned,
+                    "detections": list(getattr(parsed, "detections", []) or []),
+                    "model_id": getattr(parsed, "model_id", None),
                     "registration": registration,
                     "ball": None,
                     "n_detections": len(assigned),
@@ -637,6 +640,9 @@ class FilmPipeline:
             homography = snap_meta["registration"].homography.tolist()
 
         frame_h, frame_w = raw_frames[min(snap_idx, len(raw_frames) - 1)].shape[:2]
+        vision_model, vision_frames, mini_w, mini_h = _sample_vision_overlay(
+            frames_meta, grid, start, snap_idx, end, fps, still
+        )
 
         return PlayTracks(
             play_id=play_id,
@@ -653,6 +659,10 @@ class FilmPipeline:
             play_direction=direction,
             video_width=int(frame_w),
             video_height=int(frame_h),
+            vision_model=vision_model,
+            vision_frames=vision_frames,
+            minimap_width=mini_w,
+            minimap_height=mini_h,
             time_grid=grid,
         )
 
@@ -771,6 +781,72 @@ def _associate_field_players(
             unused.remove(best_id)
         assigned[best_id] = player
     return assigned, next_id
+
+
+def _vision_frame_payload(meta: dict[str, Any]) -> dict[str, Any]:
+    """Boxes + minimap points from one Roboflow frame, compact for the overlay."""
+    from gridiron.vision.roboflow import overlay_boxes_from_detections
+
+    parsed = meta.get("parsed")
+    detections = list(meta.get("detections") or [])
+    if not detections and parsed is not None:
+        detections = list(getattr(parsed, "detections", []) or [])
+    players_out: list[dict[str, Any]] = []
+    assigned = meta.get("assigned") or {}
+    for tid, player in assigned.items():
+        side = getattr(player, "side", None)
+        prefix = "O" if side == "offense" else "D" if side == "defense" else "P"
+        players_out.append(
+            {
+                "track_id": f"{prefix}_{tid}",
+                "side": side,
+                "class_name": getattr(player, "class_name", "player"),
+                "minimap_x": round(float(player.minimap_x), 1),
+                "minimap_y": round(float(player.minimap_y), 1),
+            }
+        )
+    return {
+        "boxes": overlay_boxes_from_detections(detections) if detections else [],
+        "players": players_out,
+    }
+
+
+def _sample_vision_overlay(
+    frames_meta: list[dict[str, Any]],
+    grid: np.ndarray,
+    start: int,
+    snap_idx: int,
+    end: int,
+    fps: float,
+    still: bool,
+) -> tuple[str | None, list[dict[str, Any]] | None, int | None, int | None]:
+    """Align Roboflow boxes / minimap points onto the play's time grid."""
+    from gridiron.vision.roboflow import MINIMAP_HEIGHT_PX, MINIMAP_WIDTH_PX
+
+    if not any(meta.get("detections") or meta.get("assigned") or meta.get("parsed") for meta in frames_meta):
+        return None, None, None, None
+    end_j = min(end, len(frames_meta) - 1)
+    sampled: list[dict[str, Any]] = []
+    for t in grid:
+        if still:
+            j = min(snap_idx, end_j)
+        else:
+            j = int(round(snap_idx + float(t) * max(fps, 1e-6)))
+            j = max(start, min(end_j, j))
+        sampled.append(_vision_frame_payload(frames_meta[j]))
+    if not any(frame["boxes"] or frame["players"] for frame in sampled):
+        return None, None, None, None
+    snap_meta = frames_meta[min(snap_idx, len(frames_meta) - 1)]
+    model_id = snap_meta.get("model_id")
+    parsed = snap_meta.get("parsed")
+    if not model_id and parsed is not None:
+        model_id = getattr(parsed, "model_id", None)
+    return (
+        str(model_id) if model_id else None,
+        sampled,
+        MINIMAP_WIDTH_PX,
+        MINIMAP_HEIGHT_PX,
+    )
 
 
 def _save_workflow_overlays(play_id: str, parsed: Any) -> None:

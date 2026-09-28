@@ -84,15 +84,19 @@ def _stub_frame(n_each: int = 11):
     from gridiron.vision.roboflow import FieldPlayer, CoverageCall, WorkflowFrame
 
     players = []
+    detections = []
     for i in range(n_each):
+        ox1, oy1 = 8.0 + i * 3, 10.0
+        dx1, dy1 = 30.0 + i * 2, 12.0
         players.append(
             FieldPlayer(
                 class_name="offense_player",
                 field_x=48.0 + i * 0.15,
                 field_y=12.0 + i * 2.4,
-                minimap_x=480,
-                minimap_y=120,
+                minimap_x=480 + i * 18,
+                minimap_y=180 + (i % 5) * 22,
                 confidence=0.9,
+                image_box=(ox1, oy1, ox1 + 16, oy1 + 28),
             )
         )
         players.append(
@@ -100,10 +104,31 @@ def _stub_frame(n_each: int = 11):
                 class_name="defense_player",
                 field_x=56.0 + (i % 3) * 0.8,
                 field_y=10.0 + i * 2.5,
-                minimap_x=560,
-                minimap_y=100,
+                minimap_x=620 + i * 16,
+                minimap_y=200 + (i % 6) * 20,
                 confidence=0.88,
+                image_box=(dx1, dy1, dx1 + 14, dy1 + 32),
             )
+        )
+        detections.append(
+            {
+                "x": ox1 + 8,
+                "y": oy1 + 14,
+                "width": 16,
+                "height": 28,
+                "class": "offense_player",
+                "confidence": 0.9,
+            }
+        )
+        detections.append(
+            {
+                "x": dx1 + 7,
+                "y": dy1 + 16,
+                "width": 14,
+                "height": 32,
+                "class": "defense_player",
+                "confidence": 0.88,
+            }
         )
     H = np.eye(3).tolist()
     return WorkflowFrame(
@@ -118,6 +143,8 @@ def _stub_frame(n_each: int = 11):
         image_width=64,
         image_height=48,
         notes=["test"],
+        detections=detections,
+        model_id="andre-4cotb/american-football-player-trackin-1-rfdetr-small-t1",
     )
 
 
@@ -162,6 +189,13 @@ def test_pipeline_still_uses_workflow_stub(tmp_path: Path, monkeypatch):
     assert play.quality.offense_detected >= 9
     assert pipeline.predictions == []
     assert any("still frame" in n for n in play.quality.notes)
+    assert play.vision_model and "rfdetr" in play.vision_model
+    assert play.vision_frames
+    snap = play.vision_frames[int(np.argmin(np.abs(play.time_grid)))]
+    assert len(snap["boxes"]) == 22
+    assert all(box["box"] and len(box["box"]) == 4 for box in snap["boxes"])
+    assert len(snap["players"]) == 22
+    assert {p["side"] for p in snap["players"]} == {"offense", "defense"}
 
 
 def test_parse_workflow_result_reads_listed_outputs():

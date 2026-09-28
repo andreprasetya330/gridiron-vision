@@ -112,6 +112,14 @@ def film_dir() -> Path:
     return subdir("film")
 
 
+def film_uploads_dir() -> Path:
+    return subdir("film", "uploads")
+
+
+def film_overlays_dir() -> Path:
+    return subdir("film", "overlays")
+
+
 def models_dir() -> Path:
     return subdir("models")
 
