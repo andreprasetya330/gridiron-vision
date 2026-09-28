@@ -40,6 +40,27 @@ so the tests have ground truth to check against. Swap in real data with `gridiro
 contaminate a Big Data Bowl training run. Commands default to `--source auto`, which prefers real
 data over synthetic.
 
+## Roboflow player workflow
+
+Film frames go through the hosted workflow **american-football-player-trackin** in workspace
+`andre-4cotb` (RF-DETR small). Copy `.env.example` to `.env` and set `ROBOFLOW_API_KEY` from
+[Workspace Settings → API Keys](https://app.roboflow.com/andre-4cotb/settings/api). Never commit
+the key.
+
+The Python client is `gridiron.vision.roboflow.run_player_workflow`. It uses
+`inference-sdk.InferenceHTTPClient` against `https://serverless.roboflow.com` with header auth
+(`Authorization: Bearer`). Do not put the key in the query string or JSON body.
+
+| | |
+| --- | --- |
+| Input | `image` |
+| Parameters | `confidence` (0.4), `iou_threshold` (0.3), `class_agnostic_nms` (false), `max_detections` (1000) |
+| Outputs | `predictions` (boxes: `offense_player` / `defense_player` / `official`), `inference_id`, `model_id` |
+
+`gridiron film process` and the web ingest page both call this function, then project feet onto
+the UGA minimap and score coverage with the BDB model. Clips are sampled as still frames — live
+webcam / RTSP would need Roboflow's WebRTC path, which this repo does not use.
+
 ## Commands
 
 | Command | What it does |

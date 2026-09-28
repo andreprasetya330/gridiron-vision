@@ -17,6 +17,13 @@ def _env_path(var: str, default: Path) -> Path:
     return Path(raw).expanduser().resolve() if raw else default
 
 
+def _env_float(var: str, default: float) -> float:
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
 @lru_cache(maxsize=1)
 def data_dir() -> Path:
     return _env_path("GRIDIRON_DATA_DIR", PROJECT_ROOT / "data")
@@ -149,6 +156,10 @@ class RoboflowSettings:
             "False",
             "no",
         }
+        self.player_confidence = _env_float("ROBOFLOW_PLAYER_CONFIDENCE", 0.4)
+        self.player_iou_threshold = _env_float("ROBOFLOW_PLAYER_IOU", 0.3)
+        self.timeout_s = _env_float("ROBOFLOW_TIMEOUT", 60.0)
+        self.max_retries = max(1, int(os.environ.get("ROBOFLOW_MAX_RETRIES", "3") or 3))
 
     @property
     def enabled(self) -> bool:

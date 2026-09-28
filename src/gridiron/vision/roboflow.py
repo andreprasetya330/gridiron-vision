@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import base64
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,6 +57,35 @@ EXPERIMENTAL_COVERAGE_NOTE = (
     "Workflow coverage is an experimental baseline, not coach-validated or "
     "calibrated across varied coverages."
 )
+
+# Declared on american-football-player-trackin (workflows_get, 2026-09-28).
+PLAYER_WORKFLOW_PARAMETERS = {
+    "confidence": 0.4,
+    "iou_threshold": 0.3,
+    "class_agnostic_nms": False,
+    "max_detections": 1000,
+}
+PLAYER_WORKFLOW_OUTPUT_KEYS = ("predictions", "inference_id", "model_id")
+_KEEP_DETECTION_FIELDS = (
+    "x",
+    "y",
+    "width",
+    "height",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "class",
+    "class_name",
+    "class_id",
+    "confidence",
+    "detection_id",
+    "parent_id",
+)
+
+
+class RoboflowWorkflowError(RuntimeError):
+    """The hosted Roboflow workflow did not return a usable result."""
 
 _CLASS_ALIASES = {
     "cover 0": "Cover 0 Man",
@@ -179,7 +211,153 @@ def _unwrap_result(result: Any) -> dict[str, Any]:
             return first
     if isinstance(result, dict):
         return result
-    raise ValueError(f"unexpected workflow result type: {type(result)!r}")
+    raise RoboflowWorkflowError(f"unexpected workflow result type: {type(result)!r}")
+
+
+def _is_image_blob(value: Any) -> bool:
+    if isinstance(value, (bytes, bytearray)):
+        return True
+    if isinstance(value, dict) and value.get("type") in {"base64", "url"} and "value" in value:
+        return True
+    if isinstance(value, str) and len(value) > 256 and (
+        value.strip().startswith("data:image") or value[:20].isalpha() is False
+    ):
+        return value.startswith("data:image") or (len(value) > 4000 and " " not in value[:80])
+    return False
+
+
+def _looks_like_detections(value: Any) -> bool:
+    if isinstance(value, dict) and isinstance(value.get("predictions"), list):
+        return True
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        row = value[0]
+        return any(key in row for key in ("x", "y", "class", "class_name", "width", "height"))
+    return False
+
+
+def detection_output(payload: dict[str, Any]) -> tuple[str | None, Any]:
+    """Pick the detection-shaped value from a workflow result without assuming its name."""
+    for key, value in payload.items():
+        if _looks_like_detections(value):
+            return key, value
+    return None, None
+
+
+def compact_detections(payload: Any) -> list[dict[str, Any]]:
+    """Keep box fields only — drop segmentation `points` and unused keys."""
+    rows, _width, _height = _detection_rows(payload)
+    compact: list[dict[str, Any]] = []
+    for row in rows:
+        item = {key: row[key] for key in _KEEP_DETECTION_FIELDS if key in row}
+        if item:
+            compact.append(item)
+    return compact
+
+
+def player_workflow_parameters(settings: RoboflowSettings | None = None) -> dict[str, Any]:
+    settings = settings or RoboflowSettings()
+    params = dict(PLAYER_WORKFLOW_PARAMETERS)
+    params["confidence"] = float(settings.player_confidence)
+    params["iou_threshold"] = float(settings.player_iou_threshold)
+    return params
+
+
+def run_player_workflow(
+    image: str | Path | np.ndarray,
+    *,
+    settings: RoboflowSettings | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Run `american-football-player-trackin` and return the first output dict.
+
+    Auth is `Authorization: Bearer` (inference v1.5.0+). Parameters match the
+    workflow's declared inputs. Image-shaped values are dropped from the returned
+    dict so callers never hold base64 frames.
+    """
+    settings = settings or RoboflowSettings()
+    if not settings.enabled:
+        raise RoboflowWorkflowError(
+            "ROBOFLOW_API_KEY is not set. Copy .env.example to .env and add the key "
+            "from Workspace Settings → API Keys."
+        )
+    timeout_s = float(settings.timeout_s if timeout is None else timeout)
+    image_arg = str(image) if isinstance(image, Path) else image
+    last_error: Exception | None = None
+    attempts = max(1, int(settings.max_retries))
+    for attempt in range(attempts):
+        try:
+            raw = _run_player_workflow_once(image_arg, settings, timeout_s)
+            payload = _unwrap_result(raw)
+            return _sanitize_workflow_payload(payload)
+        except RoboflowWorkflowError as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(min(8.0, 0.8 * (2**attempt)))
+        except Exception as exc:
+            last_error = RoboflowWorkflowError(str(exc))
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(min(8.0, 0.8 * (2**attempt)))
+    raise RoboflowWorkflowError(
+        f"player workflow {settings.workspace}/{settings.player_workflow_id} failed "
+        f"after {attempts} attempt(s): {last_error}"
+    ) from last_error
+
+
+def _run_player_workflow_once(
+    image: str | np.ndarray,
+    settings: RoboflowSettings,
+    timeout_s: float,
+) -> Any:
+    try:
+        from inference_sdk import InferenceConfiguration, InferenceHTTPClient
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "inference-sdk is not installed. Run `uv sync --extra vision`."
+        ) from exc
+
+    client = InferenceHTTPClient(
+        api_url=settings.api_url,
+        api_key=settings.api_key,
+    ).configure(
+        InferenceConfiguration(
+            api_key_transport="header",
+            workflow_run_retries_enabled=True,
+        )
+    )
+
+    def _call() -> Any:
+        return client.run_workflow(
+            workspace_name=settings.workspace,
+            workflow_id=settings.player_workflow_id,
+            images={"image": image},
+            parameters=player_workflow_parameters(settings),
+            use_cache=settings.use_cache,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_call)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeout as exc:
+            raise RoboflowWorkflowError(
+                f"player workflow timed out after {timeout_s:.0f}s"
+            ) from exc
+
+
+def _sanitize_workflow_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    clean: dict[str, Any] = {}
+    for key, value in payload.items():
+        if _is_image_blob(value):
+            continue
+        if _looks_like_detections(value):
+            _rows, width, height = _detection_rows(value)
+            image_meta = {"width": width, "height": height} if width or height else {}
+            clean[key] = {"image": image_meta, "predictions": compact_detections(value)}
+            continue
+        clean[key] = value
+    return clean
 
 
 def _decode_image_bytes(payload: Any) -> bytes | None:
@@ -455,11 +633,17 @@ def render_minimap(players: list[FieldPlayer]) -> bytes | None:
 
 def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) -> WorkflowFrame:
     """Player-detection workflow → field points + local minimap. No Qwen call."""
-    payload = _unwrap_result(result)
-    detections, det_w, det_h = _detection_rows(payload.get("predictions", payload))
+    payload = result if isinstance(result, dict) else _unwrap_result(result)
+    _key, detections_payload = detection_output(payload)
+    if detections_payload is None:
+        detections_payload = payload.get("predictions", payload)
+    detections = compact_detections(detections_payload)
+    _rows, det_w, det_h = _detection_rows(detections_payload)
     width = det_w or (image_size[0] if image_size else None)
     height = det_h or (image_size[1] if image_size else None)
     notes = [UGA_CALIBRATION_NOTE]
+    if payload.get("model_id"):
+        notes.append(f"model_id={payload['model_id']}")
     homography = None
     try:
         H = image_to_field_homography(width, height)
@@ -468,6 +652,13 @@ def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) 
     except Exception as exc:
         notes.append(f"could not project detections onto the field: {exc}")
         players = []
+    raw = {
+        key: value
+        for key, value in payload.items()
+        if not _is_image_blob(value)
+    }
+    if _key:
+        raw[_key] = detections
     return WorkflowFrame(
         coverage=CoverageCall(coverage=None, confidence=0.0, probabilities={c: 0.0 for c in COVERAGES}),
         players=players,
@@ -477,7 +668,7 @@ def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) 
         minimap_png=render_minimap(players),
         output_png=None,
         notes=notes,
-        raw={"predictions": detections},
+        raw=raw,
     )
 
 
@@ -512,7 +703,7 @@ class WorkflowClient:
     def __init__(self, settings: RoboflowSettings | None = None) -> None:
         self.settings = settings or RoboflowSettings()
         if not self.settings.enabled:
-            raise RuntimeError(
+            raise RoboflowWorkflowError(
                 "ROBOFLOW_API_KEY is not set. Copy .env.example to .env and add the key "
                 "from Workspace Settings → API Keys."
             )
@@ -529,23 +720,22 @@ class WorkflowClient:
             self._client = InferenceHTTPClient(
                 api_url=self.settings.api_url,
                 api_key=self.settings.api_key,
-            ).configure(InferenceConfiguration(api_key_transport="header"))
+            ).configure(
+                InferenceConfiguration(
+                    api_key_transport="header",
+                    workflow_run_retries_enabled=True,
+                )
+            )
         return self._client
 
     def run_image(self, image: str | Path | np.ndarray) -> WorkflowFrame:
         size = None
         if isinstance(image, np.ndarray) and image.ndim >= 2:
             size = (int(image.shape[1]), int(image.shape[0]))
-        image_arg = image if not isinstance(image, Path) else str(image)
         if self.settings.detect_only:
-            result = self._sdk().run_workflow(
-                workspace_name=self.settings.workspace,
-                workflow_id=self.settings.player_workflow_id,
-                images={"image": image_arg},
-                parameters={"confidence": 0.35},
-                use_cache=self.settings.use_cache,
-            )
-            return parse_player_result(result, image_size=size)
+            payload = run_player_workflow(image, settings=self.settings)
+            return parse_player_result(payload, image_size=size)
+        image_arg = image if not isinstance(image, Path) else str(image)
         result = self._sdk().run_workflow(
             workspace_name=self.settings.workspace,
             workflow_id=self.settings.workflow_id,
