@@ -40,8 +40,22 @@ def raw_dir() -> Path:
     return subdir("raw")
 
 
-def bdb_dir() -> Path:
+def bdb_dir(edition: str = "2021") -> Path:
+    """Raw Big Data Bowl CSVs. 2021 and 2025 must not share a folder."""
+    if normalize_bdb_edition(edition) == "2025":
+        return subdir("raw", "bdb2025")
     return subdir("raw", "bdb")
+
+
+def normalize_bdb_edition(edition: str | int | None) -> str:
+    text = str(edition or "2021").strip().lower().replace("bdb", "")
+    if text in {"2025", "25"}:
+        return "2025"
+    return "2021"
+
+
+def bdb_play_source(edition: str = "2021") -> str:
+    return "bdb2025" if normalize_bdb_edition(edition) == "2025" else "bdb"
 
 
 def pff_dir() -> Path:
@@ -53,7 +67,7 @@ PREDICTIONS_FILENAME = "predictions.json"
 # Real data first. `auto` picks the first of these that actually has plays, so a
 # leftover synthetic season cannot silently contaminate a Big Data Bowl training
 # run (or the other way around).
-PLAY_SOURCE_PRIORITY: tuple[str, ...] = ("bdb", "film", "pff", "hudl", "synthetic")
+PLAY_SOURCE_PRIORITY: tuple[str, ...] = ("bdb", "bdb2025", "film", "pff", "hudl", "synthetic")
 
 
 def plays_dir(source: str | None = None) -> Path:
@@ -133,11 +147,10 @@ def db_path() -> Path:
 
 
 class RoboflowSettings:
-    """Hosted film workflow: player detection, UGA-calibrated minimap, coverage class.
+    """Hosted film workflow: player detection, then local field mapping.
 
-    The homography inside the workflow is locked to one camera view. Other
-    angles need a new calibration polygon; do not treat coordinates from a
-    different shot as interchangeable with this one.
+    Roboflow returns boxes. The pipeline solves a per-frame homography from
+    painted yard lines. The UGA calibration polygon is fallback only.
     """
 
     def __init__(self) -> None:

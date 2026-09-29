@@ -1,16 +1,19 @@
-"""Roboflow player detection plus a local UGA minimap.
+"""Roboflow player detection plus a local field minimap.
 
 The hosted player workflow (`american-football-player-trackin`) finds
-`offense_player` / `defense_player` / `official`. Feet are projected through the
-UGA-broadcast homography onto a 120-yard minimap, then converted to `PlayTracks`
-so the Big Data Bowl coverage model can score the points.
+`offense_player` / `defense_player` / `official`. The pipeline projects those
+feet through a **per-frame** homography (painted yard lines) onto a 120-yard
+minimap, then converts them to `PlayTracks` so the Big Data Bowl coverage model
+can score the points.
+
+The workspace's `Football_Field_Minimap` block is not camera-agnostic: it is a
+custom Python step with the UGA calibration polygon hardcoded. Roboflow has no
+first-party football minimap that solves a new camera. That UGA matrix remains
+only as a last-resort fallback when line registration fails.
 
 The full `defensive-coverage-analysis` workflow also runs a Qwen coverage
 identifier on the minimap image. That path is opt-in (`ROBOFLOW_DETECT_ONLY=0`)
 because it is not the BDB track model and is not coach-validated.
-
-The homography is calibrated to one camera. Other pans, zooms, or venues need
-a new polygon (or automatic landmark registration).
 """
 
 from __future__ import annotations
@@ -50,8 +53,11 @@ UGA_CALIBRATION_POLYGON = (
 UGA_CALIBRATION_IMAGE_SIZE = (1920, 1080)
 
 UGA_CALIBRATION_NOTE = (
-    "Field homography is calibrated to the UGA camera view. Other angles, pans, "
-    "or zoom levels need a separate calibration or automatic landmark registration."
+    "Fallback field homography is the UGA calibration polygon. The live path "
+    "solves yard lines per frame; this matrix is used only when that fit fails."
+)
+LINE_REGISTRATION_NOTE = (
+    "Field homography from painted yard lines in this frame, not a fixed camera polygon."
 )
 EXPERIMENTAL_COVERAGE_NOTE = (
     "Workflow coverage is an experimental baseline, not coach-validated or "
@@ -579,14 +585,13 @@ def parse_workflow_result(result: Any, image_size: tuple[int, int] | None = None
     )
 
 
-def field_players_from_detections(
+def field_players_from_homography(
     detections: list[dict[str, Any]],
-    image_width: int | None,
-    image_height: int | None,
+    homography: np.ndarray,
 ) -> list[FieldPlayer]:
-    """Project player feet through the UGA homography onto field yards / minimap."""
+    """Project player feet through an image-to-field homography onto yards / minimap."""
     cv2 = require("cv2")
-    H = image_to_field_homography(image_width, image_height)
+    H = np.asarray(homography, dtype=np.float64)
     players: list[FieldPlayer] = []
     for det in detections:
         class_name = str(det.get("class") or det.get("class_name") or "player")
@@ -599,21 +604,34 @@ def field_players_from_detections(
         foot = np.asarray([[[ (x1 + x2) / 2.0, y2 ]]], dtype=np.float32)
         mapped = cv2.perspectiveTransform(foot, H)[0, 0]
         fx, fy = float(mapped[0]), float(mapped[1])
-        mx, my = fx * PX_PER_YD, fy * PX_PER_YD
-        if not (0 <= mx < MINIMAP_WIDTH_PX and 0 <= my < MINIMAP_HEIGHT_PX):
+        if not (
+            -1.5 <= fx <= FIELD_LENGTH_YD + 1.5
+            and -1.0 <= fy <= FIELD_WIDTH_YD + 1.0
+        ):
             continue
         players.append(
             FieldPlayer(
                 class_name=class_name,
                 field_x=fx,
                 field_y=fy,
-                minimap_x=mx,
-                minimap_y=my,
+                minimap_x=fx * PX_PER_YD,
+                minimap_y=fy * PX_PER_YD,
                 confidence=float(det.get("confidence") or 0.0),
                 image_box=box,
             )
         )
     return players
+
+
+def field_players_from_detections(
+    detections: list[dict[str, Any]],
+    image_width: int | None,
+    image_height: int | None,
+) -> list[FieldPlayer]:
+    """Project player feet through the UGA fallback homography."""
+    return field_players_from_homography(
+        detections, image_to_field_homography(image_width, image_height)
+    )
 
 
 def _box_xyxy(det: dict[str, Any]) -> tuple[float, float, float, float] | None:
@@ -671,17 +689,19 @@ def parse_player_result(result: Any, image_size: tuple[int, int] | None = None) 
     _rows, det_w, det_h = _detection_rows(detections_payload)
     width = det_w or (image_size[0] if image_size else None)
     height = det_h or (image_size[1] if image_size else None)
-    notes = [UGA_CALIBRATION_NOTE]
+    notes: list[str] = []
     if payload.get("model_id"):
         notes.append(f"model_id={payload['model_id']}")
     homography = None
+    players: list[FieldPlayer] = []
     try:
+        # UGA matrix is fallback only. The pipeline overwrites this when
+        # yard-line registration succeeds on the actual frame.
         H = image_to_field_homography(width, height)
         homography = H.tolist()
         players = field_players_from_detections(detections, width, height)
     except Exception as exc:
-        notes.append(f"could not project detections onto the field: {exc}")
-        players = []
+        notes.append(f"could not build UGA fallback projection: {exc}")
     raw = {
         key: value
         for key, value in payload.items()

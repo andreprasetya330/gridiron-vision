@@ -1,33 +1,13 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { api } from "../api";
 import type { Play } from "../types";
 
-const STARTER_TEAMS = [
-  "Georgia",
-  "Alabama",
-  "Ohio State",
-  "Michigan",
-  "Oregon",
-  "Texas",
-  "USC",
-  "Clemson",
-  "Notre Dame",
-  "Penn State",
-  "LSU",
-  "Florida",
-  "Miami",
-  "Tennessee",
-  "Oklahoma",
-  "Washington",
-];
-
 interface Props {
-  knownTeams: string[];
   onAnalyzed: (play: Play, defenseTeam: string) => void;
   onError: (message: string | null) => void;
 }
 
-export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
+export function FilmIngest({ onAnalyzed, onError }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [defenseTeam, setDefenseTeam] = useState("");
   const [offenseTeam, setOffenseTeam] = useState("");
@@ -35,11 +15,6 @@ export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
   const [distance, setDistance] = useState("");
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
-
-  const teams = useMemo(() => {
-    const merged = new Set([...STARTER_TEAMS, ...knownTeams]);
-    return [...merged].sort((a, b) => a.localeCompare(b));
-  }, [knownTeams]);
 
   const pickFile = (next: File | null) => {
     setFile(next);
@@ -52,7 +27,7 @@ export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
       return;
     }
     if (!defenseTeam.trim()) {
-      onError("Name the defense so the play is filed under that team.");
+      onError("Type the defense team so the play is filed under that name.");
       return;
     }
     onError(null);
@@ -84,8 +59,8 @@ export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
         <p className="eyebrow">Film room</p>
         <h2>Drop a clip. Get the tracking.</h2>
         <p className="muted">
-          The player-tracking model paints boxes on the film. The minimap is those
-          same detections projected onto the field.
+          Type the team, then drop film. Player boxes and the field minimap follow
+          every frame of the clip.
         </p>
       </div>
 
@@ -116,24 +91,22 @@ export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
         <label className="field-label">
           Defense team
           <input
-            list="defense-teams"
+            type="text"
             value={defenseTeam}
             onChange={(event) => setDefenseTeam(event.target.value)}
-            placeholder="Georgia"
+            placeholder="Type the defense team"
+            autoComplete="off"
             required
           />
         </label>
-        <datalist id="defense-teams">
-          {teams.map((team) => (
-            <option key={team} value={team} />
-          ))}
-        </datalist>
         <label className="field-label">
-          Offense
+          Offense team
           <input
+            type="text"
             value={offenseTeam}
             onChange={(event) => setOffenseTeam(event.target.value)}
-            placeholder="Optional"
+            placeholder="Type the offense team"
+            autoComplete="off"
           />
         </label>
         <label className="field-label">
@@ -160,11 +133,12 @@ export function FilmIngest({ knownTeams, onAnalyzed, onError }: Props) {
       </div>
 
       <button className="play-button ingest-submit" type="button" disabled={busy} onClick={() => void submit()}>
-        {busy ? "Analyzing film…" : "Analyze play"}
+        {busy ? "Tracking every frame…" : "Analyze play"}
       </button>
       {busy && (
         <p className="muted ingest-wait">
-          Detection and coverage scoring can take a few minutes on a full clip.
+          Player tracking runs on each frame of the clip, then the minimap is
+          overlaid on the film.
         </p>
       )}
       </div>

@@ -315,6 +315,7 @@ class FilmPipeline:
                 fps=fps / max(self.config.stride, 1),
                 snap_confidence=confidence,
                 play_id=play_id or f"{video_path.stem}-{i:03d}",
+                native_fps=fps,
             )
             if play is not None:
                 plays.append(play)
@@ -338,11 +339,12 @@ class FilmPipeline:
             source_path=image_path,
             frames=[(0, frame, result)],
             fps=10.0,
+            native_fps=1.0,
             play_id=play_id or image_path.stem,
         )
 
     def _process_roboflow(self, video_path: Path, play_id: str | None = None) -> list[PlayTracks]:
-        fps = video_fps(video_path)
+        native_fps = video_fps(video_path)
         client = self._workflow_client()
         frames: list[tuple[int, np.ndarray, Any]] = []
         for frame_index, frame in read_frames(
@@ -354,9 +356,52 @@ class FilmPipeline:
         return self._plays_from_workflow_frames(
             source_path=video_path,
             frames=frames,
-            fps=fps / max(self.config.stride, 1),
+            fps=native_fps / max(self.config.stride, 1),
+            native_fps=native_fps,
             play_id=play_id,
         )
+
+    def _map_workflow_frame(self, frame: np.ndarray, parsed: Any, smoother: Any) -> tuple[Any, Any]:
+        """Replace the UGA polygon with a per-frame yard-line homography when possible."""
+        from gridiron.vision.registration import Registration
+        from gridiron.vision.roboflow import (
+            LINE_REGISTRATION_NOTE,
+            UGA_CALIBRATION_NOTE,
+            field_players_from_homography,
+            render_minimap,
+        )
+
+        estimated = self._registrar().register(frame)
+        registration = smoother.update(estimated)
+        detections = list(getattr(parsed, "detections", []) or [])
+        notes = [n for n in list(parsed.notes or []) if n != UGA_CALIBRATION_NOTE]
+
+        if registration.homography is not None:
+            players = field_players_from_homography(detections, registration.homography)
+            parsed.players = players
+            parsed.homography = registration.homography.tolist()
+            png = render_minimap(players)
+            if png is not None:
+                parsed.minimap_png = png
+            notes.extend(registration.notes)
+            notes.append(LINE_REGISTRATION_NOTE)
+            parsed.notes = notes
+            return parsed, registration
+
+        notes.extend(estimated.notes)
+        if parsed.players:
+            notes.append("Line registration failed; using the workflow's projected coordinates.")
+            notes.append(UGA_CALIBRATION_NOTE)
+        parsed.notes = notes
+        fallback = Registration(
+            homography=(
+                np.asarray(parsed.homography, dtype=np.float64) if parsed.homography else None
+            ),
+            method="workflow",
+            reprojection_error_yd=1.5 if parsed.homography is not None else float("inf"),
+            notes=notes,
+        )
+        return parsed, fallback
 
     def _plays_from_workflow_frames(
         self,
@@ -364,16 +409,19 @@ class FilmPipeline:
         frames: list[tuple[int, np.ndarray, Any]],
         fps: float,
         play_id: str | None,
+        native_fps: float | None = None,
     ) -> list[PlayTracks]:
-        from gridiron.vision.registration import Registration
+        from gridiron.vision.registration import SmoothedRegistration
 
         frames_meta: list[dict[str, Any]] = []
         raw_frames: list[np.ndarray] = []
         prev_positions: dict[int, tuple[float, float]] = {}
         prev_sides: dict[int, str] = {}
         next_id = 1
+        smoother = SmoothedRegistration()
 
         for frame_index, frame, parsed in frames:
+            parsed, registration = self._map_workflow_frame(frame, parsed, smoother)
             assigned, next_id = _associate_field_players(
                 parsed.players, prev_positions, prev_sides, next_id
             )
@@ -381,13 +429,6 @@ class FilmPipeline:
                 tid: (player.field_x, player.field_y) for tid, player in assigned.items()
             }
             sides = {tid: player.side for tid, player in assigned.items() if player.side}
-            homography = np.asarray(parsed.homography, dtype=np.float64) if parsed.homography else None
-            registration = Registration(
-                homography=homography,
-                method="roboflow-uga",
-                reprojection_error_yd=1.5,
-                notes=list(parsed.notes),
-            )
             frames_meta.append(
                 {
                     "frame_index": frame_index,
@@ -432,6 +473,7 @@ class FilmPipeline:
                 fps=fps,
                 snap_confidence=max(confidence, 0.5),
                 play_id=this_id,
+                native_fps=native_fps or fps,
             )
             if play is None:
                 continue
@@ -472,6 +514,7 @@ class FilmPipeline:
         fps: float,
         snap_confidence: float,
         play_id: str,
+        native_fps: float | None = None,
     ) -> PlayTracks | None:
         snap_meta = frames_meta[min(snap_idx, len(frames_meta) - 1)]
         snap_positions = snap_meta["field_positions"]
@@ -641,7 +684,10 @@ class FilmPipeline:
 
         frame_h, frame_w = raw_frames[min(snap_idx, len(raw_frames) - 1)].shape[:2]
         vision_model, vision_frames, mini_w, mini_h = _sample_vision_overlay(
-            frames_meta, grid, start, snap_idx, end, fps, still
+            frames_meta,
+            start,
+            end,
+            native_fps=float(native_fps or fps),
         )
 
         return PlayTracks(
@@ -652,7 +698,7 @@ class FilmPipeline:
             quality=quality,
             video_path=str(video_path),
             snap_frame_in_video=int(snap_meta.get("frame_index", snap_idx)),
-            video_fps=fps,
+            video_fps=float(native_fps or fps),
             homography=homography,
             origin_x=float(los_x),
             origin_y=float(ball_y),
@@ -813,30 +859,28 @@ def _vision_frame_payload(meta: dict[str, Any]) -> dict[str, Any]:
 
 def _sample_vision_overlay(
     frames_meta: list[dict[str, Any]],
-    grid: np.ndarray,
     start: int,
-    snap_idx: int,
     end: int,
-    fps: float,
-    still: bool,
+    native_fps: float,
 ) -> tuple[str | None, list[dict[str, Any]] | None, int | None, int | None]:
-    """Align Roboflow boxes / minimap points onto the play's time grid."""
+    """Keep one Roboflow overlay sample per processed video frame."""
     from gridiron.vision.roboflow import MINIMAP_HEIGHT_PX, MINIMAP_WIDTH_PX
 
     if not any(meta.get("detections") or meta.get("assigned") or meta.get("parsed") for meta in frames_meta):
         return None, None, None, None
     end_j = min(end, len(frames_meta) - 1)
     sampled: list[dict[str, Any]] = []
-    for t in grid:
-        if still:
-            j = min(snap_idx, end_j)
-        else:
-            j = int(round(snap_idx + float(t) * max(fps, 1e-6)))
-            j = max(start, min(end_j, j))
-        sampled.append(_vision_frame_payload(frames_meta[j]))
+    rate = max(float(native_fps), 1e-6)
+    for j in range(start, end_j + 1):
+        meta = frames_meta[j]
+        payload = _vision_frame_payload(meta)
+        video_frame = int(meta.get("frame_index", j))
+        payload["t"] = round(video_frame / rate, 4)
+        payload["video_frame"] = video_frame
+        sampled.append(payload)
     if not any(frame["boxes"] or frame["players"] for frame in sampled):
         return None, None, None, None
-    snap_meta = frames_meta[min(snap_idx, len(frames_meta) - 1)]
+    snap_meta = frames_meta[min(max(start, 0), end_j)]
     model_id = snap_meta.get("model_id")
     parsed = snap_meta.get("parsed")
     if not model_id and parsed is not None:

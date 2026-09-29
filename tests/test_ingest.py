@@ -80,3 +80,28 @@ def test_ingest_tags_team_and_writes_play(tmp_path, monkeypatch):
     assert saved.defense_team == "Georgia"
     assert Path(saved.video_path).exists()
     cfg.data_dir.cache_clear()
+
+
+def test_ingest_tracks_every_video_frame(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRIDIRON_DATA_DIR", str(tmp_path))
+    from gridiron import config as cfg
+
+    cfg.data_dir.cache_clear()
+    clip = tmp_path / "uga-clip.mp4"
+    clip.write_bytes(b"fake-video")
+    captured: dict[str, int] = {}
+
+    def fake_process(self, video_path, play_id=None):
+        captured["stride"] = self.config.stride
+        play = _play(play_id or "x")
+        play.video_path = str(video_path)
+        return [play]
+
+    monkeypatch.setattr("gridiron.vision.pipeline.FilmPipeline.process", fake_process)
+    monkeypatch.setattr("gridiron.coverage.bridge.load_default_models", lambda: (None, None))
+
+    ingest_film(
+        FilmIngestRequest(path=clip, original_name="uga-clip.mp4", defense_team="Georgia")
+    )
+    assert captured["stride"] == 1
+    cfg.data_dir.cache_clear()

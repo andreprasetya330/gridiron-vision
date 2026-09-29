@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from gridiron.config import (
-    RoboflowSettings,
     film_uploads_dir,
     plays_dir,
     predictions_path,
@@ -103,7 +102,7 @@ def ingest_film(request: FilmIngestRequest) -> FilmIngestResult:
     if source.resolve() != stored.resolve():
         shutil.copy2(source, stored)
 
-    stride = 3 if request.backend != "local" and RoboflowSettings().enabled else 1
+    stride = 1
     pipeline = FilmPipeline(
         PipelineConfig(
             league=request.league,

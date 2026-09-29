@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { OFFENSE_COLOR, playerColor, playerLabel } from "../playerColors";
-import type { Play, VisionDetection } from "../types";
+import type { Play, VisionDetection, VisionFrame } from "../types";
+import { visionIndexAt, visionSampleAt } from "../visionLookup";
+import { PlayerMinimap } from "./PlayerMinimap";
 
 interface Props {
   play: Play;
   frame: number;
+  playing?: boolean;
+  seekTime?: number | null;
+  onMediaTime?: (time: number, visionIndex: number) => void;
+  onDuration?: (duration: number) => void;
 }
 
 function invert3(m: number[][]): number[][] | null {
@@ -59,47 +65,162 @@ function roundRect(
   ctx.closePath();
 }
 
-function visionBoxes(play: Play, frame: number): VisionDetection[] {
-  const frames = play.vision_frames ?? [];
-  return frames[frame]?.boxes ?? frames[0]?.boxes ?? [];
-}
-
 function detectionColor(det: VisionDetection, index: number): string {
   if (det.side === "offense" || det.class_name.includes("offense")) return OFFENSE_COLOR;
   if (!det.side && det.class_name.includes("official")) return "#e2e8f0";
   return playerColor(`rf-${det.class_name}-${index}`, "defense", null);
 }
 
+function drawBoxes(
+  ctx: CanvasRenderingContext2D,
+  play: Play,
+  frame: number,
+  sample: VisionFrame | undefined,
+  width: number,
+  height: number,
+) {
+  const srcW = play.video_width || width;
+  const srcH = play.video_height || height;
+  const scaleX = width / srcW;
+  const scaleY = height / srcH;
+  const boxes = sample?.boxes ?? [];
+
+  if (boxes.length) {
+    for (let i = 0; i < boxes.length; i += 1) {
+      const det = boxes[i];
+      if (!det.box) continue;
+      const [x1, y1, x2, y2] = det.box;
+      const left = x1 * scaleX;
+      const top = y1 * scaleY;
+      const boxW = Math.max(8, (x2 - x1) * scaleX);
+      const boxH = Math.max(12, (y2 - y1) * scaleY);
+      const color = detectionColor(det, i);
+      const label =
+        det.side === "offense"
+          ? "O"
+          : det.side === "defense"
+            ? "D"
+            : det.class_name === "official"
+              ? "REF"
+              : "";
+
+      ctx.fillStyle = color + "40";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(2, boxH * 0.05);
+      ctx.strokeRect(left, top, boxW, boxH);
+      ctx.fillRect(left, top, boxW, boxH);
+      if (label) {
+        ctx.font = `700 ${Math.max(11, boxH * 0.22)}px "DM Sans", system-ui`;
+        ctx.textAlign = "center";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(15, 23, 42, 0.7)";
+        ctx.strokeText(label, left + boxW / 2, Math.max(14, top - 6));
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(label, left + boxW / 2, Math.max(14, top - 6));
+      }
+    }
+    return;
+  }
+
+  const ordered = [...play.players].sort((a, b) => {
+    const ax = a.x[frame] ?? -99;
+    const bx = b.x[frame] ?? -99;
+    return ax - bx;
+  });
+
+  for (const player of ordered) {
+    const x = player.x[frame];
+    const y = player.y[frame];
+    if (x === null || y === null) continue;
+
+    const projected = fieldToImage(play, x, y);
+    const sx = projected ? projected[0] : width * (0.5 + y / 60);
+    const sy = projected ? projected[1] : height * (0.85 - x / 60);
+    const boxH = projected ? Math.max(36, height * 0.07) : 40;
+    const boxW = boxH * 0.48;
+    const color = playerColor(player.track_id, player.side, player.role);
+    const label = playerLabel(player.jersey, player.side, player.role);
+
+    ctx.fillStyle = color + "55";
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(2, boxH * 0.06);
+    ctx.strokeRect(sx - boxW / 2, sy - boxH, boxW, boxH);
+    ctx.fillRect(sx - boxW / 2, sy - boxH, boxW, boxH);
+    if (label) {
+      ctx.font = `700 ${Math.max(12, boxH * 0.2)}px "DM Sans", system-ui`;
+      ctx.textAlign = "center";
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(15, 23, 42, 0.65)";
+      ctx.strokeText(label, sx, sy - boxH - 6);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, sx, sy - boxH - 6);
+    }
+  }
+}
+
 /**
- * Boxes on real film from the player-tracking workflow. Falls back to
- * projecting field tracks through the homography when those boxes are absent.
+ * Player-tracking boxes on the clip, with the Roboflow minimap overlaid on the
+ * film so both follow the full video.
  */
-export function VideoOverlay({ play, frame }: Props) {
+export function VideoOverlay({
+  play,
+  frame,
+  playing = false,
+  seekTime = null,
+  onMediaTime,
+  onDuration,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
+  const [videoTime, setVideoTime] = useState(0);
   const isStill =
     play.media_kind === "image" ||
     /\.(jpg|jpeg|png|webp|bmp)$/i.test(play.video_path ?? "");
+  const hasVision = Boolean(play.vision_frames?.length);
 
   const fps = play.video_fps ?? 30;
   const snapFrame = play.snap_frame_in_video ?? 0;
   const timeOffset = play.time_grid[frame] ?? 0;
-  const videoTime = Math.max(0, snapFrame / fps + timeOffset);
+  const fallbackTime = Math.max(0, snapFrame / fps + timeOffset);
   const mediaSrc = `/api/plays/${encodeURIComponent(play.play_id)}/video`;
+  const sample = isStill
+    ? visionSampleAt(play, 0) ?? play.vision_frames?.[0]
+    : visionSampleAt(play, hasVision ? videoTime : fallbackTime);
 
   useEffect(() => {
     setReady(false);
+    setVideoTime(0);
   }, [play.play_id]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || isStill) return;
-    if (Math.abs(video.currentTime - videoTime) > 0.02) {
-      video.currentTime = videoTime;
+    if (playing) {
+      if (video.ended) video.currentTime = 0;
+      void video.play().catch(() => undefined);
+    } else {
+      video.pause();
     }
-  }, [videoTime, isStill]);
+  }, [playing, isStill, play.play_id]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || isStill || seekTime == null || !Number.isFinite(seekTime)) return;
+    if (Math.abs(video.currentTime - seekTime) > 0.04) {
+      video.currentTime = seekTime;
+      setVideoTime(seekTime);
+    }
+  }, [seekTime, isStill]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || isStill || hasVision) return;
+    if (Math.abs(video.currentTime - fallbackTime) > 0.02) {
+      video.currentTime = fallbackTime;
+    }
+  }, [fallbackTime, isStill, hasVision]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -116,83 +237,7 @@ export function VideoOverlay({ play, frame }: Props) {
     canvas.width = width;
     canvas.height = height;
     ctx.clearRect(0, 0, width, height);
-
-    const srcW = play.video_width || width;
-    const srcH = play.video_height || height;
-    const scaleX = width / srcW;
-    const scaleY = height / srcH;
-    const boxes = visionBoxes(play, frame);
-
-    if (boxes.length) {
-      for (let i = 0; i < boxes.length; i += 1) {
-        const det = boxes[i];
-        if (!det.box) continue;
-        const [x1, y1, x2, y2] = det.box;
-        const left = x1 * scaleX;
-        const top = y1 * scaleY;
-        const boxW = Math.max(8, (x2 - x1) * scaleX);
-        const boxH = Math.max(12, (y2 - y1) * scaleY);
-        const color = detectionColor(det, i);
-        const label =
-          det.side === "offense"
-            ? "O"
-            : det.side === "defense"
-              ? "D"
-              : det.class_name === "official"
-                ? "REF"
-                : "";
-
-        ctx.fillStyle = color + "40";
-        ctx.strokeStyle = color;
-        ctx.lineWidth = Math.max(2, boxH * 0.05);
-        ctx.strokeRect(left, top, boxW, boxH);
-        ctx.fillRect(left, top, boxW, boxH);
-        if (label) {
-          ctx.font = `700 ${Math.max(11, boxH * 0.22)}px "DM Sans", system-ui`;
-          ctx.textAlign = "center";
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "rgba(15, 23, 42, 0.7)";
-          ctx.strokeText(label, left + boxW / 2, Math.max(14, top - 6));
-          ctx.fillStyle = "#ffffff";
-          ctx.fillText(label, left + boxW / 2, Math.max(14, top - 6));
-        }
-      }
-    } else {
-      const ordered = [...play.players].sort((a, b) => {
-        const ax = a.x[frame] ?? -99;
-        const bx = b.x[frame] ?? -99;
-        return ax - bx;
-      });
-
-      for (const player of ordered) {
-        const x = player.x[frame];
-        const y = player.y[frame];
-        if (x === null || y === null) continue;
-
-        const projected = fieldToImage(play, x, y);
-        const sx = projected ? projected[0] : width * (0.5 + y / 60);
-        const sy = projected ? projected[1] : height * (0.85 - x / 60);
-        const boxH = projected ? Math.max(36, height * 0.07) : 40;
-        const boxW = boxH * 0.48;
-        const color = playerColor(player.track_id, player.side, player.role);
-        const label = playerLabel(player.jersey, player.side, player.role);
-
-        ctx.fillStyle = color + "55";
-        ctx.strokeStyle = color;
-        ctx.lineWidth = Math.max(2, boxH * 0.06);
-        ctx.strokeRect(sx - boxW / 2, sy - boxH, boxW, boxH);
-        ctx.fillRect(sx - boxW / 2, sy - boxH, boxW, boxH);
-        if (label) {
-          ctx.font = `700 ${Math.max(12, boxH * 0.2)}px "DM Sans", system-ui`;
-          ctx.textAlign = "center";
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "rgba(15, 23, 42, 0.65)";
-          ctx.strokeText(label, sx, sy - boxH - 6);
-          ctx.fillStyle = "#ffffff";
-          ctx.fillText(label, sx, sy - boxH - 6);
-        }
-      }
-    }
+    drawBoxes(ctx, play, frame, sample, width, height);
 
     const pred = play.prediction;
     const title = pred?.coverage ?? play.coverage ?? "Unscored";
@@ -212,7 +257,25 @@ export function VideoOverlay({ play, frame }: Props) {
       ctx.fillStyle = "rgba(255,255,255,0.8)";
       ctx.fillText(`Showed ${look}`, 36, 78);
     }
-  }, [play, frame, ready, isStill]);
+  }, [play, frame, ready, isStill, sample]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || isStill) return;
+    let raf = 0;
+    let lastEmit = 0;
+    const tick = (now: number) => {
+      const time = video.currentTime;
+      setVideoTime(time);
+      if (now - lastEmit > 50) {
+        lastEmit = now;
+        onMediaTime?.(time, visionIndexAt(play, time));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isStill, play, onMediaTime, ready]);
 
   if (!play.video_path) return null;
 
@@ -234,12 +297,21 @@ export function VideoOverlay({ play, frame }: Props) {
           preload="auto"
           muted
           playsInline
-          onLoadedMetadata={() => setReady(true)}
+          onLoadedMetadata={(event) => {
+            setReady(true);
+            onDuration?.(event.currentTarget.duration || 0);
+          }}
+          onEnded={() => onMediaTime?.(videoRef.current?.duration ?? videoTime, visionIndexAt(play, videoRef.current?.duration ?? videoTime))}
         />
       )}
       <canvas ref={canvasRef} className="film-canvas" />
+      {hasVision && (
+        <div className="film-minimap">
+          <PlayerMinimap play={play} sample={sample} overlay />
+        </div>
+      )}
       <div className="film-badge">
-        {play.vision_frames?.length ? "Player tracking" : "Vision overlay"}
+        {hasVision ? "Player tracking" : "Vision overlay"}
       </div>
     </div>
   );

@@ -72,6 +72,8 @@ def test_play_json_round_trips_overlay_fields(tmp_path: Path):
     play.vision_model = "andre-4cotb/american-football-player-trackin-1-rfdetr-small-t1"
     play.vision_frames = [
         {
+            "t": 0.0,
+            "video_frame": 0,
             "boxes": [
                 {
                     "class_name": "defense_player",

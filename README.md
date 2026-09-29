@@ -1,140 +1,184 @@
 # Gridiron Vision
 
-AI coverage detection for American football film. Turns game video into field coordinates,
-classifies defensive coverage, mines statistically validated pre-snap tells against a national
-baseline, and writes opponent scouting reports where every claim links back to the plays that
-produced it.
+AI coverage detection for American football film. A clip becomes field coordinates, those coordinates become a coverage call, and those calls become scouting reports in which every claim traces back to the plays that produced it.
 
-## The idea
+Vision and coverage are separate systems. **Roboflow finds players.** A **per-frame homography** puts their feet on a bird’s-eye field. Those points are `PlayTracks` — the same JSON a Big Data Bowl export or a Hudl dump would produce. A **coverage model trained on NFL tracking** reads the points. The overlay never classifies a minimap image.
 
-Split vision from coverage. **Roboflow detects players** and the UGA homography
-graphs them onto a bird's-eye minimap. Those points become `PlayTracks`. **The
-Big Data Bowl coverage model** then reads the points — the same model trained on
-NFL tracking — rather than the hosted Qwen image classifier. A still is scored as
-a pre-snap look; a video clip gets the post-snap call plus disguise. The
-homography is locked to the UGA camera view.
+```mermaid
+flowchart LR
+  subgraph film [Film]
+    Clip[All-22 clip]
+    RF[Roboflow boxes]
+    Lines[Yard-line homography]
+    PT[PlayTracks]
+    Clip --> RF --> Lines --> PT
+  end
 
-Everything downstream consumes one JSON contract (`PlayTracks`), so film, a Hudl export, or a
-PFF export all describe the same thing.
+  subgraph train [Train once]
+    BDB[Big Data Bowl tracks]
+    GB[HistGradientBoosting]
+    BDB --> GB
+  end
+
+  GB --> Score[Coverage + disguise]
+  PT --> Score
+  Score --> UI[Overlay + library]
+```
+
+## What you get
+
+| Surface | What it shows |
+| --- | --- |
+| Film overlay | Native video, player boxes on every processed frame, minimap PIP from the same detections |
+| Coverage panel | Post-snap call (what they ran), pre-snap look, disguise when man/zone or shell disagree |
+| Play library | Filed by defense team and family (Man / Zone / Prevent) |
+| CLI | Train on BDB, score a corpus, mine pre-snap tells, write a scouting report |
+
+A still is scored as a **pre-snap look**. A video clip is scored as **what they ran**, with the pre-snap model as the look. Cover 1 vs Cover 3 is not a disguise — those are the same 1-high picture.
+
+## Architecture
+
+Everything downstream of vision consumes one contract: `PlayTracks` (22 players as field yards over time, plus quality flags). Film, synthetic data, and NFL tracking all emit that object. Coverage, disguise, tell mining, and the UI never see pixels.
+
+**Film path (default ingest)**
+
+1. `POST /api/film/ingest` (web) or `gridiron film process` copies the clip and runs `FilmPipeline`.
+2. Every frame (stride 1) goes to hosted workflow [`american-football-player-trackin`](https://app.roboflow.com/andre-4cotb/workflows/american-football-player-trackin) in workspace `andre-4cotb` (RF-DETR small). Classes: `offense_player`, `defense_player`, `official`.
+3. Feet are projected through a **homography solved from painted yard lines** in that frame (`LineRegistrar`), not a fixed camera. A UGA All-22 calibration polygon is fallback only, when the line fit fails. Roboflow’s `Football_Field_Minimap` block in this workspace is that same UGA polygon and is not used on the live path.
+4. Tracks become `data/plays/film/<id>.json`. Coverage is scored with `baseline_postsnap.joblib` / `baseline_presnap.joblib`. Rows land in `data/plays/predictions.json`.
+
+Auth for Roboflow is header Bearer (`Authorization: Bearer`). Do not put the API key in the query string or JSON body. Live webcam / RTSP would need Roboflow WebRTC; this repo samples files as frames.
+
+**Coverage path (train once, score many)**
+
+- **Post-snap** (`gridiron train baseline --mode postsnap`) — histogram gradient boosting on engineered features from the first ~2.5s after the snap. This is what the overlay loads.
+- **Pre-snap** (`--mode presnap`) — alignment and motion before the snap. Harder; disguise uses it.
+- **Set transformer** (`gridiron train net`) — optional, with a per-defender role head. The overlay prefers the booster if both exist.
+
+Holdout is later **weeks** when the corpus has them. Public BDB 2021 coverage labels are often week 1 only; then training holds out whole **games** instead of an 80/20 play split (plays from the same game share personnel and game plan).
+
+Latest local BDB 2021 post-snap holdout (weeks 15–17, 3,253 plays): **70.6%** 8-class accuracy (majority 36.7%), **88.2%** man vs zone, **80.1%** shell, **89.5%** top-2. Pre-snap on the same split: **55.8%** / **80%** man-zone / **67%** shell. Locked gates live in `src/gridiron/coverage/success.py`. Cover 6 and Cover 1↔Cover 3 are the weak cells; film accuracy is dominated by track quality (missing safeties, homography error), not another two points on this table.
 
 ## Quick start
 
-```powershell
-# 1. Install (uv handles the Python 3.12 toolchain and the cu128 PyTorch wheels)
-uv sync --extra dev --extra vision
+Python 3.12, [uv](https://docs.astral.sh/uv/), Node 18+.
 
-# 2. Generate a synthetic season so every stage runs end to end without external downloads
+```powershell
+# 1. Install
+uv sync --extra dev --extra vision
+cd web; npm install; cd ..
+
+# 2. Synthetic season so every stage runs without downloads
 uv run gridiron demo
 
-# 3. Open the overlay
+# 3. Overlay
 uv run gridiron serve
-cd web; npm install; npm run dev
+cd web; npm run dev
 ```
 
-`gridiron demo` builds a synthetic but football-realistic season (coverage-conditioned player
-alignments, per-team tendencies, deliberately planted tells), trains the models on it, mines the
-tells, and writes a scouting report. It exists so you can see the whole system work on day one and
-so the tests have ground truth to check against. Swap in real data with `gridiron ingest` and
-`gridiron bdb` and nothing downstream changes. Play JSON is stored per corpus
-(`data/plays/synthetic`, `data/plays/bdb`, `data/plays/film`) so a leftover demo season cannot
-contaminate a Big Data Bowl training run. Commands default to `--source auto`, which prefers real
-data over synthetic.
+API: `http://127.0.0.1:8000`. UI: `http://127.0.0.1:5173`.
 
-## Roboflow player workflow
+`gridiron demo` builds a football-realistic synthetic season, trains models, mines planted tells, and writes a scouting report. Play JSON is stored per corpus (`data/plays/synthetic`, `data/plays/bdb`, `data/plays/film`) so a leftover demo cannot contaminate a Big Data Bowl run. `--source auto` prefers real data over synthetic.
 
-Film frames go through the hosted workflow **american-football-player-trackin** in workspace
-`andre-4cotb` (RF-DETR small). Copy `.env.example` to `.env` and set `ROBOFLOW_API_KEY` from
-[Workspace Settings → API Keys](https://app.roboflow.com/andre-4cotb/settings/api). Never commit
-the key.
+### Film ingest
 
-The Python client is `gridiron.vision.roboflow.run_player_workflow`. It uses
-`inference-sdk.InferenceHTTPClient` against `https://serverless.roboflow.com` with header auth
-(`Authorization: Bearer`). Do not put the key in the query string or JSON body.
+```powershell
+copy .env.example .env
+# Set ROBOFLOW_API_KEY from https://app.roboflow.com/andre-4cotb/settings/api
+uv run gridiron film process path\to\clip.mp4
+```
 
-| | |
+Or use **Ingest film** in the UI: typed defense team, MP4 or still, then boxes + minimap on the clip.
+
+| Workflow | Value |
 | --- | --- |
-| Input | `image` |
-| Parameters | `confidence` (0.4), `iou_threshold` (0.3), `class_agnostic_nms` (false), `max_detections` (1000) |
-| Outputs | `predictions` (boxes: `offense_player` / `defense_player` / `official`), `inference_id`, `model_id` |
+| Id | `american-football-player-trackin` |
+| Host | `https://serverless.roboflow.com` |
+| Parameters | `confidence` 0.4, `iou_threshold` 0.3, `class_agnostic_nms` false, `max_detections` 1000 |
+| Outputs | `predictions`, `inference_id`, `model_id` |
 
-`gridiron film process` and the web ingest page both call this function, then project feet onto
-the UGA minimap and score coverage with the BDB model. Clips are sampled as still frames — live
-webcam / RTSP would need Roboflow's WebRTC path, which this repo does not use.
+`ROBOFLOW_DETECT_ONLY=1` (default) is player boxes + local mapping + BDB coverage. Set `0` only if you want the experimental hosted Qwen coverage identifier on a minimap image — that is not the BDB track model.
+
+### Train coverage on Big Data Bowl
+
+```powershell
+uv run gridiron bdb download
+uv run gridiron bdb build
+uv run gridiron train baseline --mode postsnap --source bdb
+uv run gridiron train baseline --mode presnap --source bdb
+```
+
+Needs a [Kaggle API token](https://www.kaggle.com/docs/api) for the 2021 competition files. Coverage labels fall back to public ngscleanR copies if the old extra Kaggle dataset is gone.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `gridiron demo` | Full synthetic pipeline: data, training, tells, report |
-| `gridiron bdb download` | Fetch Big Data Bowl 2021 via kagglehub (needs a Kaggle API token) |
-| `gridiron bdb status` | Show which BDB files and coverage-label weeks are on disk |
-| `gridiron bdb build` | Normalize BDB into `data/plays/bdb/` and persist league coverage rates |
-| `gridiron train baseline` | Gradient boosting on engineered features (`--source auto\|bdb\|synthetic\|film`) |
-| `gridiron train net` | Set-transformer over the 22 tracks + per-defender role head |
-| `gridiron film process <video-or-image>` | Roboflow player detect → minimap points → BDB coverage model |
-| `gridiron film evaluate` | Score detection and tracking against corpus ground truth |
-| `gridiron film bridge` | Measure how much accuracy the camera costs the coverage model |
-| `gridiron film finetune <data.yaml>` | Fine-tune the player detector |
-| `gridiron corpus seed` | Render synthetic All-22 clips with labels so the pipeline has film to run on |
+| `gridiron demo` | Synthetic season: data, training, tells, report |
+| `gridiron doctor` | Check CUDA / install |
+| `gridiron bdb download` | Fetch Big Data Bowl 2021 via kagglehub |
+| `gridiron bdb status` | Which BDB files and coverage-label weeks are on disk |
+| `gridiron bdb build` | Normalize BDB into `data/plays/bdb/` and persist league rates |
+| `gridiron train baseline` | Gradient boosting (`--source auto\|bdb\|synthetic\|film`, `--mode presnap\|postsnap`) |
+| `gridiron train net` | Set transformer + per-defender role head |
+| `gridiron film process <file>` | Detect → yard-line homography → BDB coverage |
+| `gridiron film evaluate` | Detection / tracking vs corpus ground truth |
+| `gridiron film bridge` | How many accuracy points the camera costs |
+| `gridiron corpus seed` | Render labeled synthetic All-22 clips |
 | `gridiron corpus add <video>` | Register a real clip (angle, source, rights) |
-| `gridiron corpus export` | Write a YOLO dataset of frames to label |
-| `gridiron score` | Run the coverage model over plays on disk and write `predictions.json` |
-| `gridiron ingest cfbd --ping` | Verify the CollegeFootballData API key |
-| `gridiron ingest cfbd --team "Washington" --season 2025` | Pull play context from CollegeFootballData |
-| `gridiron ingest pff` | Import whatever PFF exports are sitting in `data/pff/` |
-| `gridiron tells mine --team X` | Mine tells vs the national baseline, FDR corrected |
-| `gridiron tells validate --team X` | Forward-validate tells and report hit rates |
-| `gridiron scout --team X` | Build the evidence bundle and write the report |
-| `gridiron scout --self-scout --team Washington` | Find the tells you are giving away |
-| `gridiron serve` | FastAPI backend for the overlay UI |
+| `gridiron corpus export` | YOLO dataset of frames to label |
+| `gridiron score` | Score plays on disk → `predictions.json` |
+| `gridiron ingest cfbd --ping` | Verify CollegeFootballData |
+| `gridiron ingest cfbd --team "Washington" --season 2025` | Play context from CFBD |
+| `gridiron ingest pff` | Import CSVs dropped in `data/pff/` |
+| `gridiron tells mine --team X` | Tells vs national baseline, FDR corrected |
+| `gridiron tells validate --team X` | Forward-validate hit rates |
+| `gridiron scout --team X` | Evidence bundle + report |
+| `gridiron scout --self-scout --team Washington` | Tells you are giving away |
+| `gridiron serve` | FastAPI for the overlay |
 
-## Data sources
+## Data
 
-**Works today, free:**
-- [CollegeFootballData](https://collegefootballdata.com) - free API key, gives situation, drives,
-  advanced stats, PPA/EPA, rosters, matchup history. Everything except coverage.
-- nflverse / nflfastR play-by-play, and NFL Big Data Bowl for the coverage labels themselves.
+| Source | Role |
+| --- | --- |
+| [NFL Big Data Bowl 2021](https://www.kaggle.com/c/nfl-big-data-bowl-2021) | 10 Hz tracking + community coverage labels. This is how the coverage model exists without hand-labeling thousands of clips. |
+| [CollegeFootballData](https://collegefootballdata.com) | Situation, drives, PPA/EPA, rosters. Everything except coverage. Free API key. |
+| Film (Hudl / All-22) | Roboflow + homography → `PlayTracks`. Hudl cutups belong to the program. |
+| PFF | No public developer API. Drop exported CSVs in `data/pff/`; the importer sniffs headers. Session-cookie scraping is out of scope. |
 
-**PFF:** there is no public developer API. `premium.pff.com/api/v1/...` is an internal front-end
-endpoint requiring a logged-in session cookie, and automating against it violates their terms. So
-`ingest/pff.py` implements a **drop-folder importer** instead: export CSVs from whatever PFF tier
-you have into `data/pff/`, and it sniffs headers and maps columns automatically. `PffSessionSource`
-is a documented stub, deliberately not implemented.
-
-## Honest limits
-
-- The **national baseline** for college coverage rates has to come from your own processed film
-  corpus, which starts empty. Until it grows, the system falls back to NFL rates written by
-  `gridiron bdb build` (`data/cache/bdb/coverage_rates.json`) and labels the baseline as
-  `borrowed` everywhere it is displayed.
-- Training holds out later **weeks** when the corpus has them. The public BDB coverage labels are
-  week 1 only, so in that case the split holds out whole **games** instead of cutting the play list
-  80/20 (plays from the same game share personnel and game plan).
-- **Sample size is the real enemy**, not model accuracy. A defense gives you ~65 snaps a game; with
-  ~50 cues x 8 coverages you are running hundreds of comparisons, so chance alone produces
-  convincing fake tells every week. The mining engine applies minimum sample thresholds,
-  beta-binomial shrinkage, Wilson intervals, and Benjamini-Hochberg FDR correction, then
-  forward-validates each tell on later weeks and displays its actual hit rate.
-- **Film rights**: Hudl cutups belong to the program. Real UW film needs a coach to say yes.
-- **NCAA tech rules**: this is a film-room and scouting tool, not a gameday sideline device.
+`data/` is gitignored (plays, models, uploads). Never commit `.env`.
 
 ## Layout
 
 ```
 src/gridiron/
-  tracking/    play representation, normalization, BDB loaders, synthetic generator
-  coverage/    features, gradient boosting baseline, set-transformer, training, eval
-  vision/      detection, tracking, field registration, corpus, pipeline, eval
-  ingest/      CFBD client, nflverse loaders, PFF drop-folder importer, unified schema
-  cues/        pre-snap cue vocabulary
-  tells/       random forest + SHAP, baseline comparison, FDR, forward validation
-  scouting/    evidence bundles and report generation
-  db/          DuckDB + Parquet play store
-  api/         FastAPI
-web/           React overlay
+  tracking/    PlayTracks, BDB loaders, synthetic generator
+  coverage/    features, booster, set transformer, train, eval, disguise
+  vision/      Roboflow client, yard-line registration, ingest, pipeline
+  ingest/      CFBD, nflverse, PFF drop-folder
+  cues/        pre-snap vocabulary
+  tells/       forest + SHAP, FDR, forward validation
+  scouting/    evidence bundles and reports
+  db/          DuckDB + Parquet
+  api/         FastAPI (`POST /api/film/ingest`)
+web/           React overlay (Vite)
+tests/
 ```
 
-## GPU note
+## Limits
 
-The RTX 5060 is Blackwell (sm_120). Only CUDA 12.8+ wheels contain kernels for it. `pyproject.toml`
-pins the `pytorch-cu128` index for `torch` and `torchvision`. Verify with `uv run gridiron doctor`.
+- **College coverage rates** start empty. Until the film corpus grows, tell mining borrows NFL rates from `gridiron bdb build` and labels the baseline `borrowed`.
+- **Sample size** is the real enemy of tells. ~65 snaps a game × ~50 cues × 8 coverages produces fake “tells” by chance. Mining uses support floors, beta-binomial shrinkage, Wilson intervals, Benjamini–Hochberg FDR, then forward-validates on later weeks.
+- **Homography** needs visible yard lines. Broadcast pans, tight ends, and empty end-zone shots will fall back to the UGA polygon or drop off the field.
+- **Player model** is a small RF-DETR on a tiny All-22 set. Precision on film is mostly better boxes and labels, not a new coverage architecture.
+- **NCAA tech rules**: film-room and scouting, not a gameday sideline device.
+- **GPU**: RTX 5060 is Blackwell (`sm_120`). `pyproject.toml` pins CUDA 12.8 PyTorch wheels. `uv run gridiron doctor` to verify.
+
+## Development
+
+```powershell
+uv run pytest
+uv run ruff check src tests
+```
+
+Vision tests that render synthetic All-22 need `opencv` (`--extra vision`).

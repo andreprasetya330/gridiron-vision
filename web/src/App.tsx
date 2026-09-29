@@ -3,7 +3,6 @@ import { api } from "./api";
 import { CoveragePanel } from "./components/CoveragePanel";
 import { FieldView } from "./components/FieldView";
 import { FilmIngest } from "./components/FilmIngest";
-import { PlayerMinimap } from "./components/PlayerMinimap";
 import { VideoOverlay } from "./components/VideoOverlay";
 import type { Health, Play, PlaySummary } from "./types";
 
@@ -36,7 +35,6 @@ function groupByTeamAndFamily(plays: PlaySummary[]): LibraryGroup[] {
 
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
-  const [teams, setTeams] = useState<{ team: string; plays: number }[]>([]);
   const [source, setSource] = useState<string>("film");
   const [team, setTeam] = useState<string>("");
   const [filtersReady, setFiltersReady] = useState(false);
@@ -50,6 +48,9 @@ export default function App() {
   const [showTrails, setShowTrails] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [libraryTick, setLibraryTick] = useState(0);
+  const [mediaTime, setMediaTime] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
+  const [seekTime, setSeekTime] = useState<number | null>(null);
 
   const rafRef = useRef<number | null>(null);
   const lastTickRef = useRef<number>(0);
@@ -59,18 +60,8 @@ export default function App() {
       .health()
       .then(setHealth)
       .catch((e) => setError(String(e)));
-    api
-      .teams(source)
-      .then((r) => {
-        setTeams(r.teams);
-        setTeam((current) => {
-          if (current && r.teams.some((t) => t.team === current)) return current;
-          return "";
-        });
-        setFiltersReady(true);
-      })
-      .catch(() => setFiltersReady(true));
-  }, [source]);
+    setFiltersReady(true);
+  }, []);
 
   useEffect(() => {
     refreshCatalog();
@@ -82,7 +73,6 @@ export default function App() {
     api
       .plays(
         {
-          team: team || undefined,
           coverage: coverageFilter || undefined,
           disguised_only: disguiseOnly || undefined,
           source,
@@ -102,7 +92,7 @@ export default function App() {
         setError(String(e));
       });
     return () => controller.abort();
-  }, [filtersReady, team, coverageFilter, disguiseOnly, source, libraryTick]);
+  }, [filtersReady, coverageFilter, disguiseOnly, source, libraryTick]);
 
   useEffect(() => {
     if (!selected) {
@@ -115,6 +105,10 @@ export default function App() {
       .then((p) => {
         setPlay(p);
         setFrame(p.time_grid.findIndex((t) => Math.abs(t) < 1e-6) || 20);
+        setMediaTime(0);
+        setMediaDuration(0);
+        setSeekTime(0);
+        setPlaying(false);
       })
       .catch((e) => {
         if (e instanceof Error && e.name === "AbortError") return;
@@ -124,8 +118,21 @@ export default function App() {
   }, [selected]);
 
   const nFrames = play?.time_grid.length ?? 51;
+  const filmClock = Boolean(
+    play?.video_path && play.media_kind !== "image" && play.vision_frames?.length,
+  );
   const disguiseCount = useMemo(() => plays.filter((p) => p.disguised).length, [plays]);
-  const library = useMemo(() => groupByTeamAndFamily(plays), [plays]);
+  const visiblePlays = useMemo(() => {
+    const query = team.trim().toLowerCase();
+    if (!query) return plays;
+    return plays.filter((item) => (item.defense_team || "").toLowerCase().includes(query));
+  }, [plays, team]);
+  const library = useMemo(() => groupByTeamAndFamily(visiblePlays), [visiblePlays]);
+
+  const handleMediaTime = useCallback((time: number, visionIndex: number) => {
+    setMediaTime(time);
+    setFrame(visionIndex);
+  }, []);
 
   const tick = useCallback(
     (timestamp: number) => {
@@ -139,13 +146,13 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (playing) {
+    if (playing && !filmClock) {
       rafRef.current = requestAnimationFrame(tick);
     }
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [playing, tick]);
+  }, [playing, tick, filmClock]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -163,10 +170,7 @@ export default function App() {
   }, [nFrames]);
 
   const currentTime = play?.time_grid[frame] ?? 0;
-  const visionFrame = play?.vision_frames?.[frame] ?? play?.vision_frames?.[0];
-  const hasVision = Boolean(
-    visionFrame && ((visionFrame.boxes?.length ?? 0) > 0 || (visionFrame.players?.length ?? 0) > 0),
-  );
+  const hasVision = Boolean(play?.vision_frames?.length);
   const matchup = play
     ? `${play.defense_team ?? "Defense"} vs ${play.offense_team ?? "offense"}`
     : "Drop film to analyze a play";
@@ -205,7 +209,6 @@ export default function App() {
           </header>
 
           <FilmIngest
-            knownTeams={teams.map((item) => item.team)}
             onError={setError}
             onAnalyzed={(next, defenseTeam) => {
               setSource("film");
@@ -229,7 +232,6 @@ export default function App() {
                   onChange={(e) => {
                     setFiltersReady(false);
                     setPlays([]);
-                    setTeams([]);
                     setPlay(null);
                     setSelected(null);
                     setTeam("");
@@ -242,15 +244,14 @@ export default function App() {
               </label>
 
               <label className="field-label">
-                Defense
-                <select value={team} onChange={(e) => setTeam(e.target.value)}>
-                  <option value="">All teams</option>
-                  {teams.map((t) => (
-                    <option key={t.team} value={t.team}>
-                      {t.team} ({t.plays})
-                    </option>
-                  ))}
-                </select>
+                Defense team
+                <input
+                  type="text"
+                  value={team}
+                  onChange={(e) => setTeam(e.target.value)}
+                  placeholder="Type a team"
+                  autoComplete="off"
+                />
               </label>
 
               <label className="field-label">
@@ -358,35 +359,34 @@ export default function App() {
 
                   <div className="stage-body">
                     <div className="stage-visuals">
-                      {play.video_path && <VideoOverlay play={play} frame={frame} />}
-                      <div className="minimap-row">
-                        {hasVision ? (
-                          <div className="minimap-pane">
-                            <p className="minimap-label">
-                              Player layout
-                              {visionFrame?.players?.length
-                                ? ` · ${visionFrame.players.length} detections`
-                                : ""}
-                            </p>
-                            <PlayerMinimap play={play} frame={frame} />
-                          </div>
-                        ) : (
+                      {play.video_path && (
+                        <VideoOverlay
+                          play={play}
+                          frame={frame}
+                          playing={playing}
+                          seekTime={seekTime}
+                          onMediaTime={handleMediaTime}
+                          onDuration={setMediaDuration}
+                        />
+                      )}
+                      {!hasVision && (
+                        <div className="minimap-row">
                           <div className="minimap-pane">
                             <p className="minimap-label">Minimap</p>
                             <FieldView play={play} frame={frame} showTrails={showTrails} />
                           </div>
-                        )}
-                        {play.minimap_url && !hasVision && (
-                          <div className="minimap-pane">
-                            <p className="minimap-label">Bird&apos;s-eye snapshot</p>
-                            <img
-                              className="minimap-still"
-                              src={play.minimap_url}
-                              alt="Projected player minimap"
-                            />
-                          </div>
-                        )}
-                      </div>
+                          {play.minimap_url && (
+                            <div className="minimap-pane">
+                              <p className="minimap-label">Bird&apos;s-eye snapshot</p>
+                              <img
+                                className="minimap-still"
+                                src={play.minimap_url}
+                                alt="Projected player minimap"
+                              />
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {!play.video_path && (
                         <p className="muted film-hint">No film clip on this play.</p>
                       )}
@@ -394,17 +394,35 @@ export default function App() {
                         <button className="play-button" onClick={() => setPlaying((p) => !p)}>
                           {playing ? "Pause" : "Play"}
                         </button>
-                        <input
-                          type="range"
-                          min={0}
-                          max={nFrames - 1}
-                          value={frame}
-                          onChange={(e) => setFrame(Number(e.target.value))}
-                        />
+                        {filmClock ? (
+                          <input
+                            type="range"
+                            min={0}
+                            max={Math.max(mediaDuration, 0.01)}
+                            step={0.01}
+                            value={Math.min(mediaTime, mediaDuration || mediaTime)}
+                            onChange={(e) => {
+                              const next = Number(e.target.value);
+                              setPlaying(false);
+                              setMediaTime(next);
+                              setSeekTime(next);
+                            }}
+                          />
+                        ) : (
+                          <input
+                            type="range"
+                            min={0}
+                            max={nFrames - 1}
+                            value={frame}
+                            onChange={(e) => setFrame(Number(e.target.value))}
+                          />
+                        )}
                         <span className="timecode">
-                          {Math.abs(currentTime) < 1e-6
-                            ? SNAP_LABEL
-                            : `${currentTime > 0 ? "+" : ""}${currentTime.toFixed(2)}s`}
+                          {filmClock
+                            ? `${mediaTime.toFixed(2)}s`
+                            : Math.abs(currentTime) < 1e-6
+                              ? SNAP_LABEL
+                              : `${currentTime > 0 ? "+" : ""}${currentTime.toFixed(2)}s`}
                         </span>
                       </div>
                     </div>

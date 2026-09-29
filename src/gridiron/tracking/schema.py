@@ -224,8 +224,8 @@ class PlayTracks:
     play_direction: str = "right"
     video_width: int | None = None
     video_height: int | None = None
-    # Roboflow player-workflow overlay: image-space boxes plus the projected
-    # minimap layout, aligned to `time_grid`. Absent on BDB / synthetic plays.
+    # Roboflow player-workflow overlay: one sample per processed video frame
+    # (`t` is seconds from the start of the clip). Absent on BDB / synthetic plays.
     vision_model: str | None = None
     vision_frames: list[dict[str, Any]] | None = None
     minimap_width: int | None = None

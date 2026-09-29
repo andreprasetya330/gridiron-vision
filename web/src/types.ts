@@ -125,6 +125,8 @@ export interface VisionPlayer {
 export interface VisionFrame {
   boxes: VisionDetection[];
   players: VisionPlayer[];
+  t?: number;
+  video_frame?: number;
 }
 
 export interface PlaySummary {

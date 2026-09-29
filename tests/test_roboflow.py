@@ -191,11 +191,41 @@ def test_pipeline_still_uses_workflow_stub(tmp_path: Path, monkeypatch):
     assert any("still frame" in n for n in play.quality.notes)
     assert play.vision_model and "rfdetr" in play.vision_model
     assert play.vision_frames
-    snap = play.vision_frames[int(np.argmin(np.abs(play.time_grid)))]
+    assert len(play.vision_frames) == 1
+    snap = play.vision_frames[0]
+    assert snap["t"] == 0
     assert len(snap["boxes"]) == 22
     assert all(box["box"] and len(box["box"]) == 4 for box in snap["boxes"])
     assert len(snap["players"]) == 22
     assert {p["side"] for p in snap["players"]} == {"offense", "defense"}
+
+
+def test_vision_overlay_keeps_every_processed_frame(tmp_path: Path, monkeypatch):
+    pytest.importorskip("cv2")
+    monkeypatch.setenv("GRIDIRON_DATA_DIR", str(tmp_path / "data"))
+    from gridiron import config as cfg
+
+    cfg.data_dir.cache_clear()
+    pipeline = FilmPipeline(
+        PipelineConfig(backend="roboflow", league="ncaa"),
+        workflow=_FakeWorkflow(),
+    )
+    frames = [
+        (index, np.zeros((48, 64, 3), dtype=np.uint8), _stub_frame())
+        for index in range(8)
+    ]
+    plays = pipeline._plays_from_workflow_frames(
+        source_path=tmp_path / "clip.mp4",
+        frames=frames,
+        fps=10.0,
+        native_fps=30.0,
+        play_id="clip",
+    )
+    assert len(plays) == 1
+    assert plays[0].video_fps == 30.0
+    assert [row["video_frame"] for row in plays[0].vision_frames] == list(range(8))
+    assert [row["t"] for row in plays[0].vision_frames] == [round(i / 30.0, 4) for i in range(8)]
+    cfg.data_dir.cache_clear()
 
 
 def test_parse_workflow_result_reads_listed_outputs():
@@ -234,6 +264,118 @@ def test_parse_workflow_result_reads_listed_outputs():
     assert parsed.coverage.coverage == "Cover 0 Man"
     assert parsed.players[0].field_x == pytest.approx(20.0)
     assert parsed.image_width == 1920
+
+
+def test_field_players_from_homography_uses_the_supplied_matrix():
+    cv2 = pytest.importorskip("cv2")
+    from gridiron.vision.roboflow import field_players_from_homography
+
+    H = np.array([[0.1, 0.0, 10.0], [0.0, 0.1, 5.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    detections = [
+        {
+            "x": 100.0,
+            "y": 50.0,
+            "width": 20.0,
+            "height": 40.0,
+            "class": "defense_player",
+            "confidence": 0.9,
+        }
+    ]
+    players = field_players_from_homography(detections, H)
+    assert len(players) == 1
+    # Foot is box bottom-center (100, 70) → (20, 12) yards.
+    assert players[0].field_x == pytest.approx(20.0, abs=0.05)
+    assert players[0].field_y == pytest.approx(12.0, abs=0.05)
+    assert players[0].minimap_x == pytest.approx(200.0, abs=0.5)
+
+
+def test_workflow_frames_project_through_line_homography_not_uga(tmp_path: Path, monkeypatch):
+    from gridiron.vision.registration import Registration
+    from gridiron.vision.roboflow import (
+        LINE_REGISTRATION_NOTE,
+        CoverageCall,
+        FieldPlayer,
+        WorkflowFrame,
+    )
+
+    class _LineFit:
+        def register(self, frame):
+            H = np.array(
+                [[0.1, 0.0, 10.0], [0.0, 0.1, 5.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            )
+            return Registration(
+                homography=H,
+                reprojection_error_yd=0.2,
+                n_correspondences=12,
+                method="lines",
+            )
+
+    detections = []
+    uga_wrong = []
+    for i in range(11):
+        ox, oy = 80.0 + i * 20.0, 80.0
+        dx, dy = 80.0 + i * 20.0, 200.0
+        detections.append(
+            {
+                "x": ox,
+                "y": oy,
+                "width": 20.0,
+                "height": 40.0,
+                "class": "offense_player",
+                "confidence": 0.9,
+            }
+        )
+        detections.append(
+            {
+                "x": dx,
+                "y": dy,
+                "width": 20.0,
+                "height": 40.0,
+                "class": "defense_player",
+                "confidence": 0.9,
+            }
+        )
+        uga_wrong.append(FieldPlayer("offense_player", 0.0, 0.0, 0.0, 0.0, 0.9))
+        uga_wrong.append(FieldPlayer("defense_player", 0.0, 0.0, 0.0, 0.0, 0.9))
+
+    parsed = WorkflowFrame(
+        coverage=CoverageCall(
+            coverage=None,
+            confidence=0.0,
+            probabilities={name: 0.0 for name in COVERAGES},
+        ),
+        players=uga_wrong,
+        homography=np.eye(3).tolist(),
+        detections=detections,
+        notes=["uga leftover"],
+    )
+    monkeypatch.setenv("GRIDIRON_DATA_DIR", str(tmp_path / "data"))
+    from gridiron import config as cfg
+
+    cfg.data_dir.cache_clear()
+    pipeline = FilmPipeline(
+        PipelineConfig(backend="roboflow", league="ncaa"),
+        workflow=_FakeWorkflow(),
+        registrar=_LineFit(),
+    )
+    plays = pipeline._plays_from_workflow_frames(
+        source_path=tmp_path / "still.jpg",
+        frames=[(0, np.zeros((240, 320, 3), dtype=np.uint8), parsed)],
+        fps=1.0,
+        native_fps=1.0,
+        play_id="line-map",
+    )
+    assert len(plays) == 1
+    overlay = plays[0].vision_frames[0]["players"]
+    xs = {round(p["minimap_x"], 0) for p in overlay}
+    # First offense foot (80, 100) → field (18, 15) → minimap (180, 150), not 0.
+    assert 180.0 in xs
+    assert 0.0 not in xs
+    assert LINE_REGISTRATION_NOTE in plays[0].quality.notes
+    assert plays[0].homography is not None
+    assert not np.allclose(plays[0].homography, np.eye(3))
+    cfg.data_dir.cache_clear()
 
 
 def test_field_players_from_detections_maps_calibration_corner():

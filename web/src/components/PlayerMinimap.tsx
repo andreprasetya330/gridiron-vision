@@ -1,31 +1,37 @@
-import type { VisionDetection, VisionPlayer, Play } from "../types";
+import type { VisionFrame, VisionPlayer, Play } from "../types";
+import { visionSampleAt } from "../visionLookup";
 
 interface Props {
   play: Play;
-  frame: number;
+  frame?: number;
+  videoTime?: number;
+  sample?: VisionFrame | null;
+  overlay?: boolean;
 }
 
 const DEFAULT_WIDTH = 1200;
 const DEFAULT_HEIGHT = 533;
 const ENDZONE = 100;
 
-function visionAt(play: Play, frame: number): { boxes: VisionDetection[]; players: VisionPlayer[] } {
-  const frames = play.vision_frames ?? [];
-  const current = frames[frame] ?? frames[0];
-  return {
-    boxes: current?.boxes ?? [],
-    players: current?.players ?? [],
-  };
+function playersOf(props: Props): VisionPlayer[] {
+  if (props.sample) return props.sample.players ?? [];
+  if (typeof props.videoTime === "number") {
+    return visionSampleAt(props.play, props.videoTime)?.players ?? [];
+  }
+  const frames = props.play.vision_frames ?? [];
+  const current = frames[props.frame ?? 0] ?? frames[0];
+  return current?.players ?? [];
 }
 
 /**
  * Bird's-eye layout of the Roboflow player workflow: same 120-yard canvas
  * the backend paints, with offense / defense dots at projected feet.
  */
-export function PlayerMinimap({ play, frame }: Props) {
+export function PlayerMinimap(props: Props) {
+  const { play, overlay } = props;
   const width = play.minimap_width ?? DEFAULT_WIDTH;
   const height = play.minimap_height ?? DEFAULT_HEIGHT;
-  const { players } = visionAt(play, frame);
+  const players = playersOf(props);
   const yardLines: number[] = [];
   for (let x = ENDZONE; x <= width - ENDZONE; x += 50) {
     yardLines.push(x);
@@ -33,7 +39,7 @@ export function PlayerMinimap({ play, frame }: Props) {
 
   return (
     <svg
-      className="player-minimap"
+      className={`player-minimap ${overlay ? "overlay" : ""}`}
       viewBox={`0 0 ${width} ${height}`}
       preserveAspectRatio="xMidYMid meet"
       role="img"
@@ -76,12 +82,7 @@ export function PlayerMinimap({ play, frame }: Props) {
               : "#f5f5f5";
         return (
           <g key={player.track_id || `${player.class_name}-${index}`}>
-            <circle
-              cx={player.minimap_x}
-              cy={player.minimap_y}
-              r={13}
-              fill="#141414"
-            />
+            <circle cx={player.minimap_x} cy={player.minimap_y} r={13} fill="#141414" />
             <circle cx={player.minimap_x} cy={player.minimap_y} r={11} fill={color} />
           </g>
         );
